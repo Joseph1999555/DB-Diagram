@@ -19,7 +19,6 @@ import {
   type NodeTypes,
 } from "@xyflow/react";
 import {
-  AlignHorizontalSpaceAround,
   ArrowDownToLine,
   ArrowLeftRight,
   Boxes,
@@ -43,6 +42,7 @@ import {
   Import,
   KeyRound,
   LockKeyhole,
+  LoaderCircle,
   Maximize2,
   MousePointer2,
   PanelLeftClose,
@@ -72,6 +72,12 @@ import {
   type DbmlTable,
 } from "@/lib/dbml";
 import type { SchemaExportFormat } from "@/lib/schema-export";
+import {
+  GROUP_FRAME_PADDING,
+  LAYOUT_GRID_SIZE,
+  TABLE_NODE_WIDTH,
+  tableNodeHeight,
+} from "@/lib/diagram-geometry";
 import {
   memo,
   startTransition,
@@ -186,7 +192,7 @@ const GROUP_PALETTE = ["#9c83ff", "#55d99a", "#51d6f5", "#f1c96d", "#ff7387"];
 const EDGE_PALETTE = ["#51d6f5", "#9c83ff", "#55d99a", "#f1c96d", "#ff7387"];
 const GENERATED_EXPORT_BLOCKED_MESSAGE = "Fix DBML errors before exporting generated schemas.";
 const DEFAULT_VIEWPORT = { x: -42, y: 28, zoom: 0.7 };
-const SNAP_GRID: [number, number] = [12, 12];
+const SNAP_GRID: [number, number] = [LAYOUT_GRID_SIZE, LAYOUT_GRID_SIZE];
 const FLOW_PRO_OPTIONS = { hideAttribution: true } as const;
 const MINIMAP_STYLE: CSSProperties = { width: 124, height: 78 };
 
@@ -241,10 +247,6 @@ function defaultPosition(name: string, index: number) {
   return known[name] ?? { x: 120 + (index % 4) * 310, y: 110 + Math.floor(index / 4) * 290 };
 }
 
-function tableHeight(table: DbmlTable) {
-  return 40 + Math.max(1, table.fields.length) * 29;
-}
-
 function resolveGroupColor(group: DbmlGroup, index: number) {
   return group.color ?? GROUP_PALETTE[index % GROUP_PALETTE.length];
 }
@@ -285,16 +287,17 @@ function buildNodes(document: DbmlDocument, layout: LayoutMap = {}): DiagramNode
 
   const groupNodes: DiagramNode[] = document.groups.flatMap((group, index) => {
     const members = group.tableIds
+      .filter((tableId) => groupByTableId.get(tableId)?.group.id === group.id)
       .map((tableId) => tableNodeById.get(tableId))
       .filter(
         (node): node is Node<TableNodeData, "tableCard"> => node !== undefined,
     );
     if (members.length === 0) return [];
 
-    const minX = Math.min(...members.map((node) => node.position.x)) - 38;
-    const minY = Math.min(...members.map((node) => node.position.y)) - 50;
-    const maxX = Math.max(...members.map((node) => node.position.x + 248)) + 38;
-    const maxY = Math.max(...members.map((node) => node.position.y + tableHeight(node.data.table))) + 38;
+    const minX = Math.min(...members.map((node) => node.position.x)) - GROUP_FRAME_PADDING.left;
+    const minY = Math.min(...members.map((node) => node.position.y)) - GROUP_FRAME_PADDING.top;
+    const maxX = Math.max(...members.map((node) => node.position.x + TABLE_NODE_WIDTH)) + GROUP_FRAME_PADDING.right;
+    const maxY = Math.max(...members.map((node) => node.position.y + tableNodeHeight(node.data.table))) + GROUP_FRAME_PADDING.bottom;
 
     return [
       {
@@ -476,6 +479,10 @@ function diagramStats(document: DbmlDocument) {
   };
 }
 
+function motionDuration(duration: number) {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : duration;
+}
+
 function Workspace() {
   const canvasRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLTextAreaElement>(null);
@@ -505,6 +512,7 @@ function Workspace() {
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
   const [backendReady, setBackendReady] = useState(false);
   const [layoutRevision, setLayoutRevision] = useState(0);
+  const [isSmartLayouting, setIsSmartLayouting] = useState(false);
   const [relationColors, setRelationColors] = useState<Record<string, string>>({});
   const [members, setMembers] = useState<Member[]>([
     { email: "you@relix.dev", displayName: "You", role: "owner", color: "#51d6f5" },
@@ -522,6 +530,8 @@ function Workspace() {
   const [historyEntries, setHistoryEntries] = useState<string[]>([DEFAULT_DBML]);
   const [historyIndex, setHistoryIndex] = useState(0);
   const nodesRef = useRef(nodes);
+  const documentModelRef = useRef(documentModel);
+  const layoutRequestRef = useRef(0);
 
   const stats = useMemo(() => diagramStats(documentModel), [documentModel]);
   const editorLineNumbers = useMemo(
@@ -560,6 +570,10 @@ function Workspace() {
   useEffect(() => {
     nodesRef.current = nodes;
   }, [nodes]);
+
+  useEffect(() => {
+    documentModelRef.current = documentModel;
+  }, [documentModel]);
 
   useEffect(() => {
     return () => {
@@ -792,25 +806,52 @@ function Workspace() {
       setSelectedRelationId(null);
       setInspectorOpen(true);
       setModal(null);
-      void flow.setCenter(node.position.x + 124, node.position.y + tableHeight((node.data as TableNodeData).table) / 2, {
+      void flow.setCenter(node.position.x + TABLE_NODE_WIDTH / 2, node.position.y + tableNodeHeight((node.data as TableNodeData).table) / 2, {
         zoom: 1,
-        duration: 420,
+        duration: motionDuration(420),
       });
     },
     [flow, nodes],
   );
 
   const fitDiagram = useCallback(() => {
-    void flow.fitView({ padding: 0.14, duration: 420, includeHiddenNodes: false });
+    void flow.fitView({ padding: 0.14, duration: motionDuration(420), includeHiddenNodes: false });
   }, [flow]);
 
-  const resetLayout = useCallback(() => {
-    const fresh = buildNodes(documentModel);
-    setNodes(fresh);
-    setLayoutRevision((revision) => revision + 1);
-    window.setTimeout(() => fitDiagram(), 50);
-    showToast("Auto-layout applied");
-  }, [documentModel, fitDiagram, setNodes, showToast]);
+  const applySmartLayout = useCallback(async () => {
+    if (isSmartLayouting || documentModel.tables.length === 0) return;
+    const sourceDocument = documentModel;
+    const requestId = layoutRequestRef.current + 1;
+    layoutRequestRef.current = requestId;
+    setIsSmartLayouting(true);
+    showToast("Analyzing groups and relationships…");
+
+    try {
+      const { computeAutoLayout } = await import("@/lib/auto-layout");
+      const result = await computeAutoLayout(sourceDocument);
+      if (layoutRequestRef.current !== requestId || documentModelRef.current !== sourceDocument) return;
+
+      setNodes(
+        buildNodes(sourceDocument, result.positions).map((node) => (
+          node.type === "tableCard"
+            ? { ...node, selected: node.id === selectedTableId }
+            : node
+        )),
+      );
+      setLayoutRevision((revision) => revision + 1);
+      const groupSummary = result.stats.groups > 0 ? ` in ${result.stats.groups} groups` : "";
+      showToast(`Smart layout applied · ${result.stats.tables} tables${groupSummary}`);
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(fitDiagram);
+      });
+    } catch {
+      if (layoutRequestRef.current === requestId) {
+        showToast("Couldn’t arrange this diagram. Your layout is unchanged.");
+      }
+    } finally {
+      if (layoutRequestRef.current === requestId) setIsSmartLayouting(false);
+    }
+  }, [documentModel, fitDiagram, isSmartLayouting, selectedTableId, setNodes, showToast]);
 
   const appendDbml = useCallback((snippet: string) => {
     setDbml((current) => `${current.trimEnd()}\n\n${snippet}\n`);
@@ -892,6 +933,11 @@ function Workspace() {
         setSelectedTableId(null);
         return;
       }
+      if (!isTyping && event.key.toLowerCase() === "l") {
+        event.preventDefault();
+        void applySmartLayout();
+        return;
+      }
       if (!isTyping && event.key.toLowerCase() === "f") {
         event.preventDefault();
         fitDiagram();
@@ -907,7 +953,7 @@ function Workspace() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [fitDiagram, flow, saveProject, showToast]);
+  }, [applySmartLayout, fitDiagram, flow, saveProject, showToast]);
 
   const exportDbml = useCallback(() => {
     downloadBlob(dbml, "text/plain;charset=utf-8", `${safeFileName(projectName)}.dbml`);
@@ -997,22 +1043,42 @@ function Workspace() {
   }, [flow, projectName, showToast]);
 
   const importText = useCallback(
-    (contents: string, layout?: LayoutMap) => {
+    async (contents: string, layout?: LayoutMap) => {
       const parsed = parseDBML(contents);
       const error = parsed.diagnostics.find((diagnostic) => diagnostic.level === "error");
       if (error || parsed.tables.length === 0) {
         showToast(error?.message ?? "No DBML tables found in this file");
         return;
       }
+
+      const importRequestId = layoutRequestRef.current + 1;
+      layoutRequestRef.current = importRequestId;
+      let resolvedLayout = layout;
+      let arranged = false;
+      if (!resolvedLayout || Object.keys(resolvedLayout).length === 0) {
+        setIsSmartLayouting(true);
+        showToast("Arranging imported schema…");
+        try {
+          const { computeAutoLayout } = await import("@/lib/auto-layout");
+          resolvedLayout = (await computeAutoLayout(parsed)).positions;
+          arranged = true;
+        } finally {
+          if (layoutRequestRef.current === importRequestId) setIsSmartLayouting(false);
+        }
+      } else {
+        setIsSmartLayouting(false);
+      }
+      if (layoutRequestRef.current !== importRequestId) return;
+
       setDbml(contents);
       setDocumentModel(parsed);
-      setNodes(buildNodes(parsed, layout));
+      setNodes(buildNodes(parsed, resolvedLayout));
       setSelectedTableId(parsed.tables[0]?.id ?? null);
       setSelectedRelationId(null);
       setActiveGroup("all");
       setModal(null);
-      window.setTimeout(() => fitDiagram(), 80);
-      showToast(`Imported ${parsed.tables.length} tables and ${parsed.relations.length} relations`);
+      window.requestAnimationFrame(() => window.requestAnimationFrame(fitDiagram));
+      showToast(`Imported ${parsed.tables.length} tables and ${parsed.relations.length} relations${arranged ? " · smart layout" : ""}`);
     },
     [fitDiagram, setNodes, showToast],
   );
@@ -1030,10 +1096,10 @@ function Workspace() {
           const importedDbml = snapshot.project?.dbml ?? snapshot.dbml;
           if (!importedDbml) throw new Error("This JSON file does not contain a DBML snapshot");
           if (snapshot.project?.name) setProjectName(snapshot.project.name);
-          importText(importedDbml, snapshot.project?.layout ?? snapshot.layout);
+          await importText(importedDbml, snapshot.project?.layout ?? snapshot.layout);
           return;
         }
-        importText(contents);
+        await importText(contents);
       } catch (error) {
         showToast(error instanceof Error ? error.message : "Import failed");
       }
@@ -1114,6 +1180,19 @@ function Workspace() {
       .slice(0, 8);
     return tables;
   }, [commandQuery, documentModel.tables]);
+
+  const commandActionMatches = useMemo(() => {
+    const query = commandQuery.trim().toLowerCase();
+    const matches = (keywords: string) => !query || keywords.includes(query);
+    return {
+      add: matches("add create new table entity"),
+      layout: matches("smart auto layout arrange organize group relationship relation diagram"),
+      fit: matches("fit center zoom view diagram canvas"),
+      export: matches("export download schema dbml prisma mysql sqlite drizzle json"),
+    };
+  }, [commandQuery]);
+
+  const hasCommandActionMatch = Object.values(commandActionMatches).some(Boolean);
 
   const outlineTables = useMemo(() => {
     const query = outlineQuery.trim().toLowerCase();
@@ -1363,7 +1442,12 @@ function Workspace() {
           )}
         </aside>
 
-        <section className="canvas-shell" ref={canvasRef} aria-label="Entity relationship diagram canvas">
+        <section
+          className="canvas-shell"
+          ref={canvasRef}
+          aria-label="Entity relationship diagram canvas"
+          aria-busy={isSmartLayouting}
+        >
           {!editorOpen && (
             <button className="icon-btn floating-open-panel left" onClick={() => setEditorOpen(true)} aria-label="Open DBML editor" title="Open editor">
               <PanelLeftOpen size={15} />
@@ -1487,8 +1571,14 @@ function Workspace() {
             <button className="tool-btn toolbar-hide-mobile" onClick={() => openPanel("outline")} aria-label="Manage groups" title="Manage groups">
               <Boxes size={14} />
             </button>
-            <button className="tool-btn toolbar-hide-mobile" onClick={resetLayout} aria-label="Auto-layout diagram" title="Auto-layout">
-              <WandSparkles size={14} />
+            <button
+              className="tool-btn toolbar-hide-mobile"
+              onClick={() => void applySmartLayout()}
+              aria-label="Apply smart layout"
+              title="Smart layout — arrange by groups and relationships (L)"
+              disabled={isSmartLayouting || documentModel.tables.length === 0}
+            >
+              {isSmartLayouting ? <LoaderCircle className="spin" size={14} /> : <WandSparkles size={14} />}
             </button>
             <div className="toolbar-sep" />
             <button className="tool-btn" onClick={() => flow.zoomOut({ duration: 180 })} aria-label="Zoom out" title="Zoom out">
@@ -1784,12 +1874,13 @@ function Workspace() {
                 value={commandQuery}
                 onChange={(event) => setCommandQuery(event.target.value)}
                 autoFocus
+                aria-label="Search commands, tables, and fields"
                 placeholder="Find tables, fields, or run a command…"
               />
               <span className="shortcut-chip">ESC</span>
             </div>
             <div className="command-results">
-              <div className="command-section">Schema</div>
+              {commandItems.length > 0 && <div className="command-section">Schema</div>}
               {commandItems.map((table) => (
                 <button className="command-item" key={table.id} onClick={() => focusTable(table.id)}>
                   <Table2 className="command-icon" size={13} />
@@ -1797,25 +1888,37 @@ function Workspace() {
                   <span className="command-hint">{table.fields.length} fields</span>
                 </button>
               ))}
-              {!commandQuery && (
+              {hasCommandActionMatch && (
                 <>
                   <div className="command-section">Actions</div>
-                  <button className="command-item" onClick={() => { setModal(null); addTable(); }}>
-                    <Plus className="command-icon" size={13} /><span>Add a new table</span><span className="command-hint">T</span>
-                  </button>
-                  <button className="command-item" onClick={() => { setModal(null); resetLayout(); }}>
-                    <AlignHorizontalSpaceAround className="command-icon" size={13} /><span>Auto-layout schema</span><span className="command-hint">L</span>
-                  </button>
-                  <button className="command-item" onClick={() => { setModal(null); fitDiagram(); }}>
-                    <Maximize2 className="command-icon" size={13} /><span>Fit diagram to view</span><span className="command-hint">F</span>
-                  </button>
-                  <button className="command-item" onClick={() => setModal("export")}>
-                    <ArrowDownToLine className="command-icon" size={13} /><span>Export project</span><span className="command-hint">⌘ E</span>
-                  </button>
+                  {commandActionMatches.add && (
+                    <button className="command-item" onClick={() => { setModal(null); addTable(); }}>
+                      <Plus className="command-icon" size={13} /><span>Add a new table</span><span className="command-hint">T</span>
+                    </button>
+                  )}
+                  {commandActionMatches.layout && (
+                    <button
+                      className="command-item"
+                      onClick={() => { setModal(null); void applySmartLayout(); }}
+                      disabled={isSmartLayouting || documentModel.tables.length === 0}
+                    >
+                      <WandSparkles className="command-icon" size={13} /><span>Smart layout</span><span className="command-hint">L</span>
+                    </button>
+                  )}
+                  {commandActionMatches.fit && (
+                    <button className="command-item" onClick={() => { setModal(null); fitDiagram(); }}>
+                      <Maximize2 className="command-icon" size={13} /><span>Fit diagram to view</span><span className="command-hint">F</span>
+                    </button>
+                  )}
+                  {commandActionMatches.export && (
+                    <button className="command-item" onClick={() => setModal("export")}>
+                      <ArrowDownToLine className="command-icon" size={13} /><span>Export project</span><span className="command-hint">⌘ E</span>
+                    </button>
+                  )}
                 </>
               )}
-              {commandQuery && commandItems.length === 0 && (
-                <div style={{ padding: 24, color: "var(--muted)", textAlign: "center", fontSize: 10 }}>No table or field matched “{commandQuery}”.</div>
+              {commandQuery && commandItems.length === 0 && !hasCommandActionMatch && (
+                <div style={{ padding: 24, color: "var(--muted)", textAlign: "center", fontSize: 10 }}>No command, table, or field matched “{commandQuery}”.</div>
               )}
             </div>
           </div>

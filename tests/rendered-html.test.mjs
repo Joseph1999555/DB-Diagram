@@ -68,6 +68,12 @@ test("ships persistent themes and the diagram performance contracts", async () =
   assert.match(workspace, /change\.dragging !== true/);
   assert.match(workspace, /requestIdleCallback/);
   assert.match(workspace, /Promise\.allSettled/);
+  assert.match(workspace, /await import\("@\/lib\/auto-layout"\)/);
+  assert.doesNotMatch(workspace, /from ["']elkjs/);
+  assert.match(workspace, /aria-busy=\{isSmartLayouting\}/);
+  assert.match(workspace, /aria-label="Apply smart layout"/);
+  assert.match(workspace, /event\.key\.toLowerCase\(\) === "l"/);
+  assert.match(workspace, /Search commands, tables, and fields/);
 
   const flowStart = workspace.indexOf("<ReactFlow");
   const flowEnd = workspace.indexOf("<Background", flowStart);

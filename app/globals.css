@@ -938,6 +938,16 @@ select:focus-visible,
   background: var(--panel-3);
 }
 
+.tool-btn:disabled,
+.command-item:disabled {
+  cursor: wait;
+  opacity: 0.48;
+}
+
+.spin {
+  animation: spin 800ms linear infinite;
+}
+
 .tool-btn.active {
   color: var(--accent);
   box-shadow: 0 0 0 1px var(--line) inset;
@@ -1744,6 +1754,12 @@ select:focus-visible,
   from {
     opacity: 0;
     transform: translateY(8px);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 
