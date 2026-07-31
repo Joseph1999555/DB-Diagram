@@ -1,6 +1,7 @@
 @import "tailwindcss";
 
 :root {
+  color-scheme: dark;
   --bg: #070a0f;
   --panel: #0b1017;
   --panel-2: #0f151f;
@@ -19,7 +20,18 @@
   --warning: #f1c96d;
   --danger: #ff7387;
   --canvas-grid: rgba(120, 145, 174, 0.15);
+  --editor-text: #cbd8e7;
+  --edge-muted: #526175;
+  --scrim: rgba(2, 5, 9, 0.68);
   --shadow: 0 18px 52px rgba(0, 0, 0, 0.38);
+  --shadow-float: 0 8px 28px rgba(0, 0, 0, 0.18);
+  --shadow-node: 0 12px 34px rgba(0, 0, 0, 0.28);
+  --shadow-node-selected: 0 16px 44px rgba(0, 0, 0, 0.34);
+  --shadow-modal: 0 30px 90px rgba(0, 0, 0, 0.5);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
 }
 
 * {
@@ -81,7 +93,8 @@ select:focus-visible,
   overflow: hidden;
 }
 
-.relix-app[data-theme="light"] {
+:root[data-theme="light"] {
+  color-scheme: light;
   --bg: #e9eef4;
   --panel: #f8fafc;
   --panel-2: #f1f5f9;
@@ -100,7 +113,46 @@ select:focus-visible,
   --warning: #b07917;
   --danger: #c43d55;
   --canvas-grid: rgba(50, 72, 97, 0.13);
+  --editor-text: #314254;
+  --edge-muted: #718096;
+  --scrim: rgba(30, 41, 55, 0.32);
   --shadow: 0 18px 48px rgba(27, 39, 51, 0.14);
+  --shadow-float: 0 8px 24px rgba(45, 60, 76, 0.11);
+  --shadow-node: 0 10px 28px rgba(45, 60, 76, 0.13);
+  --shadow-node-selected: 0 14px 38px rgba(45, 60, 76, 0.17);
+  --shadow-modal: 0 28px 72px rgba(35, 48, 64, 0.2);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    color-scheme: light;
+    --bg: #e9eef4;
+    --panel: #f8fafc;
+    --panel-2: #f1f5f9;
+    --panel-3: #ffffff;
+    --node: #ffffff;
+    --line: #d7e0e9;
+    --line-strong: #bdcad7;
+    --text: #101720;
+    --text-soft: #324050;
+    --muted: #667487;
+    --muted-2: #8995a4;
+    --accent: #0b96b5;
+    --accent-soft: rgba(11, 150, 181, 0.1);
+    --violet: #7358d9;
+    --success: #238a5d;
+    --warning: #b07917;
+    --danger: #c43d55;
+    --canvas-grid: rgba(50, 72, 97, 0.13);
+    --editor-text: #314254;
+    --edge-muted: #718096;
+    --scrim: rgba(30, 41, 55, 0.32);
+    --shadow: 0 18px 48px rgba(27, 39, 51, 0.14);
+    --shadow-float: 0 8px 24px rgba(45, 60, 76, 0.11);
+    --shadow-node: 0 10px 28px rgba(45, 60, 76, 0.13);
+    --shadow-node-selected: 0 14px 38px rgba(45, 60, 76, 0.17);
+    --shadow-modal: 0 28px 72px rgba(35, 48, 64, 0.2);
+  }
 }
 
 .topbar {
@@ -251,6 +303,55 @@ select:focus-visible,
   align-items: center;
   gap: 7px;
   padding: 0 12px;
+}
+
+.theme-switcher {
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel-2);
+}
+
+.theme-option {
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 7px;
+  border-radius: 6px;
+  color: var(--text-soft);
+  background: transparent;
+  font-size: 9px;
+  font-weight: 620;
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+}
+
+.theme-cycle-option {
+  width: 26px;
+  height: 26px;
+  display: none;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--text-soft);
+  background: var(--panel-3);
+  box-shadow: 0 0 0 1px var(--line) inset;
+  cursor: pointer;
+}
+
+.theme-option:hover {
+  color: var(--text);
+}
+
+.theme-option.active {
+  color: var(--text);
+  background: var(--panel-3);
+  box-shadow: 0 0 0 1px var(--line) inset;
 }
 
 .icon-btn,
@@ -523,7 +624,10 @@ select:focus-visible,
 }
 
 .line-number-list {
+  margin: 0;
   padding-right: 10px;
+  font: inherit;
+  line-height: inherit;
   will-change: transform;
 }
 
@@ -535,7 +639,7 @@ select:focus-visible,
   padding: 15px 14px 32px 55px;
   border: 0;
   outline: 0;
-  color: #cbd8e7;
+  color: var(--editor-text);
   background: transparent;
   caret-color: var(--accent);
   font-family: var(--font-geist-mono), Consolas, monospace;
@@ -544,10 +648,6 @@ select:focus-visible,
   line-height: 19px;
   tab-size: 2;
   white-space: pre;
-}
-
-.relix-app[data-theme="light"] .dbml-editor {
-  color: #314254;
 }
 
 .dbml-editor::placeholder {
@@ -748,7 +848,7 @@ select:focus-visible,
   border: 1px solid var(--line);
   border-radius: 9px;
   background: color-mix(in srgb, var(--panel) 90%, transparent);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+  box-shadow: var(--shadow-float);
   backdrop-filter: blur(12px);
 }
 
@@ -864,7 +964,7 @@ select:focus-visible,
   border: 1px solid var(--line-strong);
   border-radius: 10px;
   background: var(--node);
-  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.28);
+  box-shadow: var(--shadow-node);
   transition: opacity 180ms ease, border-color 180ms ease, box-shadow 180ms ease,
     transform 180ms ease;
 }
@@ -876,7 +976,7 @@ select:focus-visible,
 .erd-node.selected {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent),
-    0 16px 44px rgba(0, 0, 0, 0.34),
+    var(--shadow-node-selected),
     0 0 30px color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
@@ -1051,7 +1151,7 @@ select:focus-visible,
 }
 
 .react-flow__edge-path {
-  stroke: #526175;
+  stroke: var(--edge-muted);
   stroke-width: 1.35;
   transition: opacity 180ms ease, stroke 180ms ease, stroke-width 180ms ease;
 }
@@ -1294,7 +1394,7 @@ select:focus-visible,
   display: grid;
   place-items: center;
   padding: 20px;
-  background: rgba(2, 5, 9, 0.68);
+  background: var(--scrim);
   backdrop-filter: blur(7px);
   animation: fade-in 140ms ease both;
 }
@@ -1306,7 +1406,7 @@ select:focus-visible,
   border: 1px solid var(--line-strong);
   border-radius: 14px;
   background: var(--panel);
-  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-modal);
   animation: modal-in 180ms ease both;
 }
 
@@ -1534,7 +1634,7 @@ select:focus-visible,
   border: 1px solid var(--line-strong);
   border-radius: 13px;
   background: var(--panel);
-  box-shadow: 0 30px 100px rgba(0, 0, 0, 0.56);
+  box-shadow: var(--shadow-modal);
   animation: modal-in 160ms ease both;
 }
 
@@ -1647,6 +1747,15 @@ select:focus-visible,
   }
 }
 
+@media (prefers-reduced-motion: no-preference) {
+  body,
+  .relix-app,
+  .topbar,
+  .activity-rail {
+    transition: background-color 160ms ease, color 160ms ease, border-color 160ms ease;
+  }
+}
+
 @media (max-width: 1220px) {
   .inspector {
     width: 260px;
@@ -1661,6 +1770,15 @@ select:focus-visible,
   .project-kicker,
   .project-slash,
   .engine-pill {
+    display: none;
+  }
+
+  .theme-option {
+    width: 26px;
+    padding: 0;
+  }
+
+  .theme-option span {
     display: none;
   }
 }
@@ -1805,6 +1923,18 @@ select:focus-visible,
   .top-actions .icon-btn:not(.mobile-essential),
   .top-actions .text-btn {
     display: none;
+  }
+
+  .theme-switcher {
+    width: 32px;
+  }
+
+  .theme-option {
+    display: none;
+  }
+
+  .theme-cycle-option {
+    display: grid;
   }
 
   .format-grid {

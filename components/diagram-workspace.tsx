@@ -11,12 +11,13 @@ import {
   ReactFlowProvider,
   useNodesState,
   useReactFlow,
+  useStore,
   type Connection,
   type Node,
+  type NodeChange,
   type NodeProps,
   type NodeTypes,
 } from "@xyflow/react";
-import { toPng } from "html-to-image";
 import {
   AlignHorizontalSpaceAround,
   ArrowDownToLine,
@@ -43,7 +44,6 @@ import {
   KeyRound,
   LockKeyhole,
   Maximize2,
-  Moon,
   MousePointer2,
   PanelLeftClose,
   PanelLeftOpen,
@@ -55,7 +55,6 @@ import {
   Settings2,
   Share2,
   Sparkles,
-  Sun,
   Table2,
   Undo2,
   Upload,
@@ -65,21 +64,17 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
+import { ThemeSwitcher } from "@/components/theme-switcher";
 import {
   parseDBML,
   type DbmlDocument,
   type DbmlGroup,
   type DbmlTable,
 } from "@/lib/dbml";
+import type { SchemaExportFormat } from "@/lib/schema-export";
 import {
-  exportDrizzleSchema,
-  exportJsonSchema,
-  exportMySql,
-  exportPostgresSql,
-  exportPrismaSchema,
-  exportSqliteSql,
-} from "@/lib/schema-export";
-import {
+  memo,
+  startTransition,
   useCallback,
   useEffect,
   useMemo,
@@ -190,12 +185,16 @@ const DEFAULT_DOCUMENT = parseDBML(DEFAULT_DBML);
 const GROUP_PALETTE = ["#9c83ff", "#55d99a", "#51d6f5", "#f1c96d", "#ff7387"];
 const EDGE_PALETTE = ["#51d6f5", "#9c83ff", "#55d99a", "#f1c96d", "#ff7387"];
 const GENERATED_EXPORT_BLOCKED_MESSAGE = "Fix DBML errors before exporting generated schemas.";
+const DEFAULT_VIEWPORT = { x: -42, y: 28, zoom: 0.7 };
+const SNAP_GRID: [number, number] = [12, 12];
+const FLOW_PRO_OPTIONS = { hideAttribution: true } as const;
+const MINIMAP_STYLE: CSSProperties = { width: 124, height: 78 };
 
 type TableNodeData = Record<string, unknown> & {
   table: DbmlTable;
   color: string;
   dimmed: boolean;
-  foreignFieldIds: string[];
+  foreignFieldIds: ReadonlySet<string>;
 };
 
 type GroupNodeData = Record<string, unknown> & {
@@ -254,11 +253,18 @@ function buildNodes(document: DbmlDocument, layout: LayoutMap = {}): DiagramNode
   const foreignFields = new Set(
     document.relations.flatMap((relation) => [relation.fromFieldId, relation.toFieldId]),
   );
+  const groupByTableId = new Map<string, { group: DbmlGroup; index: number }>();
+  document.groups.forEach((group, index) => {
+    group.tableIds.forEach((tableId) => {
+      if (!groupByTableId.has(tableId)) groupByTableId.set(tableId, { group, index });
+    });
+  });
 
-  const tableNodes: DiagramNode[] = document.tables.map((table, index) => {
-    const groupIndex = document.groups.findIndex((group) => group.tableIds.includes(table.id));
-    const group = groupIndex >= 0 ? document.groups[groupIndex] : undefined;
-    const color = table.color ?? (group ? resolveGroupColor(group, groupIndex) : GROUP_PALETTE[index % GROUP_PALETTE.length]);
+  const tableNodes: Node<TableNodeData, "tableCard">[] = document.tables.map((table, index) => {
+    const membership = groupByTableId.get(table.id);
+    const color = table.color ?? (membership
+      ? resolveGroupColor(membership.group, membership.index)
+      : GROUP_PALETTE[index % GROUP_PALETTE.length]);
 
     return {
       id: table.id,
@@ -268,16 +274,20 @@ function buildNodes(document: DbmlDocument, layout: LayoutMap = {}): DiagramNode
         table,
         color,
         dimmed: false,
-        foreignFieldIds: table.fields.filter((field) => foreignFields.has(field.id)).map((field) => field.id),
+        foreignFieldIds: new Set(
+          table.fields.filter((field) => foreignFields.has(field.id)).map((field) => field.id),
+        ),
       },
       zIndex: 3,
     };
   });
+  const tableNodeById = new Map(tableNodes.map((node) => [node.id, node]));
 
   const groupNodes: DiagramNode[] = document.groups.flatMap((group, index) => {
-    const members = tableNodes.filter(
-      (node): node is Node<TableNodeData, "tableCard"> =>
-        node.type === "tableCard" && group.tableIds.includes(node.id),
+    const members = group.tableIds
+      .map((tableId) => tableNodeById.get(tableId))
+      .filter(
+        (node): node is Node<TableNodeData, "tableCard"> => node !== undefined,
     );
     if (members.length === 0) return [];
 
@@ -305,7 +315,19 @@ function buildNodes(document: DbmlDocument, layout: LayoutMap = {}): DiagramNode
   return [...groupNodes, ...tableNodes];
 }
 
-function TableNodeCard({ data, selected }: NodeProps) {
+function tableNodePropsEqual(previous: NodeProps, next: NodeProps) {
+  const previousData = previous.data as TableNodeData;
+  const nextData = next.data as TableNodeData;
+  return (
+    previous.selected === next.selected &&
+    previousData.table === nextData.table &&
+    previousData.color === nextData.color &&
+    previousData.dimmed === nextData.dimmed &&
+    previousData.foreignFieldIds === nextData.foreignFieldIds
+  );
+}
+
+const TableNodeCard = memo(function TableNodeCard({ data, selected }: NodeProps) {
   const nodeData = data as TableNodeData;
   const { table, color, dimmed, foreignFieldIds } = nodeData;
 
@@ -336,7 +358,7 @@ function TableNodeCard({ data, selected }: NodeProps) {
             </div>
             <div className="field-badges">
               {field.primaryKey && <span className="field-badge pk">PK</span>}
-              {foreignFieldIds.includes(field.id) && !field.primaryKey && (
+              {foreignFieldIds.has(field.id) && !field.primaryKey && (
                 <span className="field-badge fk">FK</span>
               )}
               {field.unique && !field.primaryKey && <span className="field-badge">UQ</span>}
@@ -353,9 +375,9 @@ function TableNodeCard({ data, selected }: NodeProps) {
       </div>
     </div>
   );
-}
+}, tableNodePropsEqual);
 
-function GroupFrameNode({ data }: NodeProps) {
+const GroupFrameNode = memo(function GroupFrameNode({ data }: NodeProps) {
   const nodeData = data as GroupNodeData;
   return (
     <div
@@ -369,6 +391,17 @@ function GroupFrameNode({ data }: NodeProps) {
       </div>
     </div>
   );
+});
+
+function ZoomLevel() {
+  const zoom = useStore((state) => Math.round(state.transform[2] * 100));
+  return <span className="zoom-level">{zoom}%</span>;
+}
+
+function minimapNodeColor(node: Node) {
+  return node.type === "groupFrame"
+    ? "transparent"
+    : ((node.data as TableNodeData).color ?? "#51d6f5");
 }
 
 const NODE_TYPES: NodeTypes = {
@@ -446,6 +479,7 @@ function diagramStats(document: DbmlDocument) {
 function Workspace() {
   const canvasRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLTextAreaElement>(null);
+  const lineNumbersRef = useRef<HTMLPreElement>(null);
   const historySkipRef = useRef(false);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flow = useReactFlow<DiagramNode>();
@@ -466,14 +500,11 @@ function Workspace() {
   const [modal, setModal] = useState<ModalName>(null);
   const [commandQuery, setCommandQuery] = useState("");
   const [outlineQuery, setOutlineQuery] = useState("");
-  const [lineScroll, setLineScroll] = useState(0);
   const [parseError, setParseError] = useState<string | null>(null);
   const [parseLine, setParseLine] = useState<number | undefined>();
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
   const [backendReady, setBackendReady] = useState(false);
   const [layoutRevision, setLayoutRevision] = useState(0);
-  const [zoom, setZoom] = useState(72);
-  const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [relationColors, setRelationColors] = useState<Record<string, string>>({});
   const [members, setMembers] = useState<Member[]>([
     { email: "you@relix.dev", displayName: "You", role: "owner", color: "#51d6f5" },
@@ -490,8 +521,13 @@ function Workspace() {
   const [toast, setToast] = useState<string | null>(null);
   const [historyEntries, setHistoryEntries] = useState<string[]>([DEFAULT_DBML]);
   const [historyIndex, setHistoryIndex] = useState(0);
+  const nodesRef = useRef(nodes);
 
   const stats = useMemo(() => diagramStats(documentModel), [documentModel]);
+  const editorLineNumbers = useMemo(
+    () => Array.from({ length: Math.max(1, dbml.split("\n").length) }, (_, index) => index + 1).join("\n"),
+    [dbml],
+  );
   const generatedExportDisabledProps = parseError
     ? {
         disabled: true,
@@ -507,10 +543,43 @@ function Workspace() {
     toastTimerRef.current = setTimeout(() => setToast(null), 2800);
   }, []);
 
+  const handleNodesChange = useCallback((changes: NodeChange<DiagramNode>[]) => {
+    onNodesChange(changes);
+    if (
+      changes.some(
+        (change) =>
+          change.type === "position" &&
+          change.position !== undefined &&
+          change.dragging !== true,
+      )
+    ) {
+      setLayoutRevision((revision) => revision + 1);
+    }
+  }, [onNodesChange]);
+
+  useEffect(() => {
+    nodesRef.current = nodes;
+  }, [nodes]);
+
   useEffect(() => {
     return () => {
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     };
+  }, []);
+
+  useEffect(() => {
+    const preloadExports = () => {
+      void Promise.allSettled([
+        import("@/lib/schema-export"),
+        import("html-to-image"),
+      ]);
+    };
+    if ("requestIdleCallback" in window) {
+      const idleId = window.requestIdleCallback(preloadExports, { timeout: 3000 });
+      return () => window.cancelIdleCallback(idleId);
+    }
+    const timer = setTimeout(preloadExports, 1600);
+    return () => clearTimeout(timer);
   }, []);
 
   useEffect(() => {
@@ -569,10 +638,12 @@ function Workspace() {
 
       setParseError(null);
       setParseLine(undefined);
-      setDocumentModel(parsed);
-      setNodes((previous) => {
-        const positions = layoutFromNodes(previous);
-        return buildNodes(parsed, positions);
+      startTransition(() => {
+        setDocumentModel(parsed);
+        setNodes((previous) => {
+          const positions = layoutFromNodes(previous);
+          return buildNodes(parsed, positions);
+        });
       });
     }, 280);
 
@@ -605,7 +676,7 @@ function Workspace() {
         body: JSON.stringify({
           name: projectName,
           dbml,
-          layout: layoutFromNodes(nodes),
+          layout: layoutFromNodes(nodesRef.current),
         }),
       });
       if (!response.ok) throw new Error("Save rejected");
@@ -613,7 +684,7 @@ function Workspace() {
     } catch {
       setSaveStatus("offline");
     }
-  }, [backendReady, dbml, nodes, parseError, projectName]);
+  }, [backendReady, dbml, parseError, projectName]);
 
   useEffect(() => {
     if (!backendReady) return;
@@ -654,24 +725,25 @@ function Workspace() {
 
   const displayNodes = useMemo(() => {
     const hasFocus = Boolean(selectedTableId || selectedRelationId);
+    const activeTableIds = activeGroupModel ? new Set(activeGroupModel.tableIds) : null;
     return nodes.map((node) => {
       if (node.type === "groupFrame") {
         const groupData = node.data as GroupNodeData;
-        return {
-          ...node,
-          hidden: activeGroup !== "all" && groupData.group.id !== activeGroup,
-        };
+        const hidden = activeGroup !== "all" && groupData.group.id !== activeGroup;
+        return Boolean(node.hidden) === hidden ? node : { ...node, hidden };
       }
       const tableData = node.data as TableNodeData;
-      const hidden = Boolean(activeGroupModel && !activeGroupModel.tableIds.includes(node.id));
-      return {
-        ...node,
-        hidden,
-        data: {
-          ...tableData,
-          dimmed: hasFocus && !connectedTableIds.has(node.id),
-        },
-      };
+      const hidden = Boolean(activeTableIds && !activeTableIds.has(node.id));
+      const dimmed = hasFocus && !connectedTableIds.has(node.id);
+      const sameHidden = Boolean(node.hidden) === hidden;
+      const sameDimmed = tableData.dimmed === dimmed;
+      return sameHidden && sameDimmed
+        ? node
+        : {
+            ...node,
+            hidden,
+            data: sameDimmed ? tableData : { ...tableData, dimmed },
+          };
     });
   }, [activeGroup, activeGroupModel, connectedTableIds, nodes, selectedRelationId, selectedTableId]);
 
@@ -692,7 +764,7 @@ function Workspace() {
         pathOptions: { borderRadius: 8, offset: 20 },
         markerEnd: {
           type: MarkerType.ArrowClosed,
-          color: highlighted ? color : "#526175",
+          color: highlighted ? color : "var(--edge-muted)",
           width: 12,
           height: 12,
         },
@@ -843,76 +915,64 @@ function Workspace() {
     showToast("DBML exported");
   }, [dbml, projectName, showToast]);
 
-  const exportPostgres = useCallback(() => {
+  const exportGeneratedSchema = useCallback(async (
+    format: SchemaExportFormat,
+    mime: string,
+    suffix: string,
+    label: string,
+  ) => {
     if (parseError) {
       showToast(GENERATED_EXPORT_BLOCKED_MESSAGE);
       return;
     }
-    downloadBlob(exportPostgresSql(documentModel), "text/sql;charset=utf-8", `${safeFileName(projectName)}.postgres.sql`);
-    setModal(null);
-    showToast("PostgreSQL exported");
+    try {
+      const { exportSchema } = await import("@/lib/schema-export");
+      downloadBlob(
+        exportSchema(documentModel, format),
+        mime,
+        `${safeFileName(projectName)}.${suffix}`,
+      );
+      setModal(null);
+      showToast(`${label} exported`);
+    } catch {
+      showToast(`${label} export could not finish`);
+    }
   }, [documentModel, parseError, projectName, showToast]);
 
-  const exportMysql = useCallback(() => {
-    if (parseError) {
-      showToast(GENERATED_EXPORT_BLOCKED_MESSAGE);
-      return;
-    }
-    downloadBlob(exportMySql(documentModel), "text/sql;charset=utf-8", `${safeFileName(projectName)}.mysql.sql`);
-    setModal(null);
-    showToast("MySQL exported");
-  }, [documentModel, parseError, projectName, showToast]);
+  const exportPostgres = useCallback(() => void exportGeneratedSchema(
+    "postgresql", "text/sql;charset=utf-8", "postgres.sql", "PostgreSQL",
+  ), [exportGeneratedSchema]);
 
-  const exportSqlite = useCallback(() => {
-    if (parseError) {
-      showToast(GENERATED_EXPORT_BLOCKED_MESSAGE);
-      return;
-    }
-    downloadBlob(exportSqliteSql(documentModel), "text/sql;charset=utf-8", `${safeFileName(projectName)}.sqlite.sql`);
-    setModal(null);
-    showToast("SQLite exported");
-  }, [documentModel, parseError, projectName, showToast]);
+  const exportMysql = useCallback(() => void exportGeneratedSchema(
+    "mysql", "text/sql;charset=utf-8", "mysql.sql", "MySQL",
+  ), [exportGeneratedSchema]);
 
-  const exportPrisma = useCallback(() => {
-    if (parseError) {
-      showToast(GENERATED_EXPORT_BLOCKED_MESSAGE);
-      return;
-    }
-    downloadBlob(exportPrismaSchema(documentModel), "text/plain;charset=utf-8", `${safeFileName(projectName)}.prisma`);
-    setModal(null);
-    showToast("Prisma schema exported");
-  }, [documentModel, parseError, projectName, showToast]);
+  const exportSqlite = useCallback(() => void exportGeneratedSchema(
+    "sqlite", "text/sql;charset=utf-8", "sqlite.sql", "SQLite",
+  ), [exportGeneratedSchema]);
 
-  const exportDrizzle = useCallback(() => {
-    if (parseError) {
-      showToast(GENERATED_EXPORT_BLOCKED_MESSAGE);
-      return;
-    }
-    downloadBlob(exportDrizzleSchema(documentModel), "text/typescript;charset=utf-8", `${safeFileName(projectName)}.drizzle.ts`);
-    setModal(null);
-    showToast("Drizzle schema exported");
-  }, [documentModel, parseError, projectName, showToast]);
+  const exportPrisma = useCallback(() => void exportGeneratedSchema(
+    "prisma", "text/plain;charset=utf-8", "prisma", "Prisma schema",
+  ), [exportGeneratedSchema]);
 
-  const exportJsonSchemaFile = useCallback(() => {
-    if (parseError) {
-      showToast(GENERATED_EXPORT_BLOCKED_MESSAGE);
-      return;
-    }
-    downloadBlob(exportJsonSchema(documentModel), "application/schema+json;charset=utf-8", `${safeFileName(projectName)}.schema.json`);
-    setModal(null);
-    showToast("JSON Schema exported");
-  }, [documentModel, parseError, projectName, showToast]);
+  const exportDrizzle = useCallback(() => void exportGeneratedSchema(
+    "drizzle", "text/typescript;charset=utf-8", "drizzle.ts", "Drizzle schema",
+  ), [exportGeneratedSchema]);
+
+  const exportJsonSchemaFile = useCallback(() => void exportGeneratedSchema(
+    "json-schema", "application/schema+json;charset=utf-8", "schema.json", "JSON Schema",
+  ), [exportGeneratedSchema]);
 
   const exportRelixSnapshot = useCallback(() => {
     const snapshot = JSON.stringify(
-      { version: 1, project: { name: projectName, dbml, layout: layoutFromNodes(nodes) } },
+      { version: 1, project: { name: projectName, dbml, layout: layoutFromNodes(nodesRef.current) } },
       null,
       2,
     );
     downloadBlob(snapshot, "application/json", `${safeFileName(projectName)}.relix.json`);
     setModal(null);
     showToast("Relix snapshot exported");
-  }, [dbml, nodes, projectName, showToast]);
+  }, [dbml, projectName, showToast]);
 
   const exportPng = useCallback(async () => {
     const viewport = canvasRef.current?.querySelector(".react-flow__viewport") as HTMLElement | null;
@@ -920,19 +980,21 @@ function Workspace() {
     setModal(null);
     showToast("Rendering diagram…");
     try {
+      const imageModule = import("html-to-image");
       await flow.fitView({ padding: 0.08, duration: 250, includeHiddenNodes: false });
       await new Promise((resolve) => window.setTimeout(resolve, 320));
+      const { toPng } = await imageModule;
       const dataUrl = await toPng(viewport, {
         cacheBust: true,
         pixelRatio: 2,
-        backgroundColor: theme === "dark" ? "#070a0f" : "#e9eef4",
+        backgroundColor: document.documentElement.dataset.theme === "light" ? "#e9eef4" : "#070a0f",
       });
       downloadDataUrl(dataUrl, `${safeFileName(projectName)}.png`);
       showToast("PNG exported");
     } catch {
       showToast("PNG export could not finish");
     }
-  }, [flow, projectName, showToast, theme]);
+  }, [flow, projectName, showToast]);
 
   const importText = useCallback(
     (contents: string, layout?: LayoutMap) => {
@@ -1079,7 +1141,7 @@ function Workspace() {
   };
 
   return (
-    <main className="relix-app" data-theme={theme}>
+    <main className="relix-app">
       <header className="topbar">
         <div className="brand" aria-label="Relix home">
           <div className="brand-mark" aria-hidden="true" />
@@ -1120,6 +1182,7 @@ function Workspace() {
             <Redo2 size={14} />
           </button>
           <div className="divider-vertical" />
+          <ThemeSwitcher />
           <div className="avatars" aria-label={`${members.length} collaborators`}>
             {members.slice(0, 3).map((member, index) => (
               <div
@@ -1177,14 +1240,6 @@ function Workspace() {
             <History size={17} />
           </button>
           <div className="rail-spacer" />
-          <button
-            className="rail-btn"
-            onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
-            aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
-            title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
-          >
-            {theme === "dark" ? <Moon size={17} /> : <Sun size={17} />}
-          </button>
           <button className="rail-btn" onClick={() => showToast("Workspace settings are ready for your team")} aria-label="Settings" title="Settings">
             <Settings2 size={17} />
           </button>
@@ -1220,18 +1275,18 @@ function Workspace() {
             <>
               <div className="code-editor-shell">
                 <div className="line-numbers" aria-hidden="true">
-                  <div className="line-number-list" style={{ transform: `translateY(-${lineScroll}px)` }}>
-                    {Array.from({ length: Math.max(1, dbml.split("\n").length) }, (_, index) => (
-                      <div key={index}>{index + 1}</div>
-                    ))}
-                  </div>
+                  <pre className="line-number-list" ref={lineNumbersRef}>{editorLineNumbers}</pre>
                 </div>
                 <textarea
                   ref={editorRef}
                   className="dbml-editor"
                   value={dbml}
                   onChange={(event) => setDbml(event.target.value)}
-                  onScroll={(event) => setLineScroll(event.currentTarget.scrollTop)}
+                  onScroll={(event) => {
+                    if (lineNumbersRef.current) {
+                      lineNumbersRef.current.style.transform = `translateY(-${event.currentTarget.scrollTop}px)`;
+                    }
+                  }}
                   spellCheck={false}
                   aria-label="DBML source editor"
                 />
@@ -1353,8 +1408,7 @@ function Workspace() {
             nodes={displayNodes}
             edges={displayEdges}
             nodeTypes={NODE_TYPES}
-            onNodesChange={onNodesChange}
-            onNodeDragStop={() => setLayoutRevision((revision) => revision + 1)}
+            onNodesChange={handleNodesChange}
             onNodeClick={(_event, node) => {
               if (node.type !== "tableCard") return;
               setSelectedTableId(node.id);
@@ -1371,28 +1425,28 @@ function Workspace() {
               setSelectedRelationId(null);
             }}
             onConnect={onConnect}
-            onMove={(_event, viewport) => setZoom(Math.round(viewport.zoom * 100))}
-            defaultViewport={{ x: -42, y: 28, zoom: 0.7 }}
+            defaultViewport={DEFAULT_VIEWPORT}
             minZoom={0.18}
             maxZoom={2.4}
             snapToGrid
-            snapGrid={[12, 12]}
+            snapGrid={SNAP_GRID}
             panOnDrag={canvasMode === "pan" ? true : [1, 2]}
             selectionOnDrag={canvasMode === "select"}
             nodesDraggable={canvasMode === "select"}
             nodesConnectable={canvasMode === "select"}
+            onlyRenderVisibleElements
             fitView={false}
             elevateEdgesOnSelect
-            proOptions={{ hideAttribution: true }}
+            proOptions={FLOW_PRO_OPTIONS}
             aria-label="Interactive entity relationship diagram"
           >
             <Background variant={BackgroundVariant.Dots} gap={22} size={1} />
             <MiniMap
               pannable
               zoomable
-              nodeColor={(node) => (node.type === "groupFrame" ? "transparent" : ((node.data as TableNodeData).color ?? "#51d6f5"))}
+              nodeColor={minimapNodeColor}
               nodeStrokeWidth={2}
-              style={{ width: 124, height: 78 }}
+              style={MINIMAP_STYLE}
               ariaLabel="Diagram minimap"
             />
           </ReactFlow>
@@ -1440,7 +1494,7 @@ function Workspace() {
             <button className="tool-btn" onClick={() => flow.zoomOut({ duration: 180 })} aria-label="Zoom out" title="Zoom out">
               <ZoomOut size={14} />
             </button>
-            <span className="zoom-level">{zoom}%</span>
+            <ZoomLevel />
             <button className="tool-btn" onClick={() => flow.zoomIn({ duration: 180 })} aria-label="Zoom in" title="Zoom in">
               <ZoomIn size={14} />
             </button>

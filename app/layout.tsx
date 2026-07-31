@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { headers } from "next/headers";
+import { THEME_STORAGE_KEY } from "@/lib/theme";
 import "@xyflow/react/dist/style.css";
 import "./globals.css";
 
@@ -13,6 +14,8 @@ const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
   subsets: ["latin"],
 });
+
+const THEME_BOOTSTRAP = `(()=>{try{const s=localStorage.getItem(${JSON.stringify(THEME_STORAGE_KEY)});const p=s==="light"||s==="dark"||s==="system"?s:"system";const d=p==="dark"||(p==="system"&&matchMedia("(prefers-color-scheme: dark)").matches)?"dark":"light";const r=document.documentElement;r.dataset.theme=d;r.dataset.themePreference=p;r.style.colorScheme=d}catch{}})();`;
 
 export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();
@@ -58,7 +61,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_BOOTSTRAP }} />
+      </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >

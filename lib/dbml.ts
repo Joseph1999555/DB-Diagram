@@ -716,6 +716,7 @@ function parseNamedSettings(settings?: string): {
 
 function collectBlocks(source: string, diagnostics: DbmlDiagnostic[]): BlockDeclaration[] {
   const blocks: BlockDeclaration[] = [];
+  const lineStarts = collectLineStarts(source);
   let index = 0;
   let depth = 0;
   let quote: string | null = null;
@@ -760,7 +761,7 @@ function collectBlocks(source: string, diagnostics: DbmlDiagnostic[]): BlockDecl
           continue;
         }
         const end = findMatchingBrace(source, open);
-        const line = lineNumberAt(source, index);
+        const line = lineNumberAt(lineStarts, index);
         if (end < 0) {
           diagnostics.push({
             level: "error",
@@ -1273,12 +1274,25 @@ function hasOuterParens(source: string): boolean {
   return depth === 0;
 }
 
-function lineNumberAt(source: string, index: number): number {
-  let line = 1;
-  for (let cursor = 0; cursor < index; cursor += 1) {
-    if (source[cursor] === "\n") line += 1;
+function collectLineStarts(source: string): number[] {
+  const lineStarts = [0];
+  for (let index = 0; index < source.length; index += 1) {
+    if (source[index] === "\n") lineStarts.push(index + 1);
   }
-  return line;
+  return lineStarts;
+}
+
+function lineNumberAt(lineStarts: readonly number[], index: number): number {
+  let lower = 0;
+  let upper = lineStarts.length;
+
+  while (lower < upper) {
+    const middle = lower + Math.floor((upper - lower) / 2);
+    if (lineStarts[middle] <= index) lower = middle + 1;
+    else upper = middle;
+  }
+
+  return lower;
 }
 
 function readWordEnd(source: string, start: number): number {
