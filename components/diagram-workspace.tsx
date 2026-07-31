@@ -208,6 +208,23 @@ const DEFAULT_VIEWPORT = { x: -42, y: 28, zoom: 0.7 };
 const SNAP_GRID: [number, number] = [LAYOUT_GRID_SIZE, LAYOUT_GRID_SIZE];
 const FLOW_PRO_OPTIONS = { hideAttribution: true } as const;
 const MINIMAP_STYLE: CSSProperties = { width: 124, height: 78 };
+const PRESENCE_POLL_MS = 500;
+const PRESENCE_RETRY_MAX_MS = 5000;
+const PRESENCE_SEND_THROTTLE_MS = 350;
+const PRESENCE_HEARTBEAT_MS = 4000;
+
+type PresenceCursor = {
+  sessionId: string;
+  userId: string;
+  displayName: string;
+  x: number;
+  y: number;
+  updatedAt: string;
+};
+
+type PresencePoint = Pick<PresenceCursor, "x" | "y">;
+type PresenceStatus = "idle" | "connecting" | "live" | "offline";
+type CanvasBounds = { left: number; top: number; width: number; height: number };
 
 type TableNodeData = Record<string, unknown> & {
   table: DbmlTable;
@@ -437,6 +454,76 @@ function ZoomLevel() {
   return <span className="zoom-level">{zoom}%</span>;
 }
 
+function LivePresenceLayer({
+  cursors,
+  sessionId,
+  canvasBounds,
+  status,
+}: {
+  cursors: PresenceCursor[];
+  sessionId: string;
+  canvasBounds: CanvasBounds | null;
+  status: PresenceStatus;
+}) {
+  const flow = useReactFlow<DiagramNode>();
+  const viewportTransform = useStore((state) => state.transform);
+  const remoteCursors = useMemo(() => {
+    const seenUsers = new Set<string>();
+    return cursors.filter((cursor) => {
+      if (cursor.sessionId === sessionId || seenUsers.has(cursor.userId)) return false;
+      seenUsers.add(cursor.userId);
+      return true;
+    });
+  }, [cursors, sessionId]);
+  const positionedCursors = useMemo(() => {
+    if (!canvasBounds || !Number.isFinite(viewportTransform[2])) return [];
+    return remoteCursors.map((cursor) => {
+      const screenPoint = flow.flowToScreenPosition({ x: cursor.x, y: cursor.y });
+      return {
+        ...cursor,
+        screenX: screenPoint.x - canvasBounds.left,
+        screenY: screenPoint.y - canvasBounds.top,
+      };
+    });
+  }, [canvasBounds, flow, remoteCursors, viewportTransform]);
+  const statusLabel = status === "live"
+    ? remoteCursors.length === 0
+      ? "No collaborators on the canvas"
+      : `${remoteCursors.length} ${remoteCursors.length === 1 ? "collaborator" : "collaborators"} live on the canvas`
+    : status === "connecting"
+      ? "Connecting live presence"
+      : status === "offline"
+        ? "Live presence unavailable"
+        : "Live presence paused";
+
+  return (
+    <>
+      <div className={`presence-live-status ${status}`} role="status" aria-live="polite" aria-atomic="true">
+        <span className="presence-live-dot" aria-hidden="true" />
+        {statusLabel}
+      </div>
+      <div className="presence-layer" aria-hidden="true">
+        {positionedCursors.map((cursor) => (
+          <div
+            className="presence-cursor"
+            key={cursor.sessionId}
+            style={{
+              "--presence-x": `${cursor.screenX}px`,
+              "--presence-y": `${cursor.screenY}px`,
+              color: commentAvatarColor(cursor.userId),
+            } as CSSProperties}
+          >
+            <MousePointer2 size={17} fill="currentColor" />
+            <span className="presence-label" style={{ background: commentAvatarColor(cursor.userId) }}>
+              {cursor.displayName}
+            </span>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
 function minimapNodeColor(node: Node) {
   return node.type === "groupFrame"
     ? "transparent"
@@ -460,6 +547,33 @@ function initials(value: string) {
 
 function displayName(member: Member | CurrentUser) {
   return member.displayName ?? member.name ?? member.email.split("@")[0];
+}
+
+function isPresenceCursor(value: unknown): value is PresenceCursor {
+  if (!value || typeof value !== "object") return false;
+  const cursor = value as Partial<PresenceCursor>;
+  return typeof cursor.sessionId === "string" &&
+    typeof cursor.userId === "string" &&
+    typeof cursor.displayName === "string" &&
+    typeof cursor.x === "number" && Number.isFinite(cursor.x) &&
+    typeof cursor.y === "number" && Number.isFinite(cursor.y) &&
+    typeof cursor.updatedAt === "string";
+}
+
+function presenceCursorsEqual(
+  current: PresenceCursor[],
+  next: PresenceCursor[],
+) {
+  return current.length === next.length && current.every((cursor, index) => {
+    const candidate = next[index];
+    return candidate !== undefined &&
+      cursor.sessionId === candidate.sessionId &&
+      cursor.userId === candidate.userId &&
+      cursor.displayName === candidate.displayName &&
+      cursor.x === candidate.x &&
+      cursor.y === candidate.y &&
+      cursor.updatedAt === candidate.updatedAt;
+  });
 }
 
 function commentTargetLabel(comment: ProjectComment, tables: DbmlTable[]) {
@@ -900,12 +1014,22 @@ function Workspace() {
   const [rootCommentDraft, setRootCommentDraft] = useState("");
   const [replyCommentDraft, setReplyCommentDraft] = useState("");
   const [commentPendingAction, setCommentPendingAction] = useState<string | null>(null);
+  const [presenceSessionId] = useState(() => crypto.randomUUID());
+  const [presenceCursors, setPresenceCursors] = useState<PresenceCursor[]>([]);
+  const [presenceStatus, setPresenceStatus] = useState<PresenceStatus>("idle");
+  const [canvasBounds, setCanvasBounds] = useState<CanvasBounds | null>(null);
   const [historyEntries, setHistoryEntries] = useState<string[]>([DEFAULT_DBML]);
   const [historyIndex, setHistoryIndex] = useState(0);
   const nodesRef = useRef(nodes);
   const documentModelRef = useRef(documentModel);
   const layoutRequestRef = useRef(0);
   const commentsRequestRef = useRef(0);
+  const presenceRequestRef = useRef(0);
+  const presenceLastPointRef = useRef<PresencePoint | null>(null);
+  const presenceLastSentAtRef = useRef(0);
+  const presenceSendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const presenceAnnouncedRef = useRef(false);
+  const presencePutControllersRef = useRef(new Set<AbortController>());
 
   const stats = useMemo(() => diagramStats(documentModel), [documentModel]);
   const editorLineNumbers = useMemo(
@@ -926,6 +1050,203 @@ function Workspace() {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     toastTimerRef.current = setTimeout(() => setToast(null), 2800);
   }, []);
+
+  const sendPresencePoint = useCallback((point: PresencePoint) => {
+    if (!backendReady || document.visibilityState !== "visible") return;
+    presenceLastSentAtRef.current = Date.now();
+    presenceAnnouncedRef.current = true;
+    const controller = new AbortController();
+    presencePutControllersRef.current.add(controller);
+    void fetch("/api/presence", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: presenceSessionId, x: point.x, y: point.y }),
+      signal: controller.signal,
+    }).catch(() => undefined).finally(() => {
+      presencePutControllersRef.current.delete(controller);
+    });
+  }, [backendReady, presenceSessionId]);
+
+  const queuePresencePoint = useCallback((point: PresencePoint) => {
+    presenceLastPointRef.current = point;
+    const elapsed = Date.now() - presenceLastSentAtRef.current;
+    const flush = () => {
+      presenceSendTimerRef.current = null;
+      const latestPoint = presenceLastPointRef.current;
+      if (latestPoint) sendPresencePoint(latestPoint);
+    };
+
+    if (elapsed >= PRESENCE_SEND_THROTTLE_MS) {
+      if (presenceSendTimerRef.current) clearTimeout(presenceSendTimerRef.current);
+      flush();
+      return;
+    }
+    if (!presenceSendTimerRef.current) {
+      presenceSendTimerRef.current = setTimeout(flush, PRESENCE_SEND_THROTTLE_MS - elapsed);
+    }
+  }, [sendPresencePoint]);
+
+  const removePresence = useCallback(() => {
+    if (presenceSendTimerRef.current) {
+      clearTimeout(presenceSendTimerRef.current);
+      presenceSendTimerRef.current = null;
+    }
+    presenceLastPointRef.current = null;
+    for (const controller of presencePutControllersRef.current) controller.abort();
+    presencePutControllersRef.current.clear();
+    if (!presenceAnnouncedRef.current) return;
+    presenceAnnouncedRef.current = false;
+    void fetch("/api/presence", {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: presenceSessionId }),
+      keepalive: true,
+    }).catch(() => undefined);
+  }, [presenceSessionId]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    let frame = 0;
+    const measure = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const rect = canvas.getBoundingClientRect();
+        const next = { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+        setCanvasBounds((current) => current &&
+          current.left === next.left && current.top === next.top &&
+          current.width === next.width && current.height === next.height
+          ? current
+          : next);
+      });
+    };
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(canvas);
+    window.addEventListener("resize", measure);
+    window.addEventListener("scroll", measure, true);
+    measure();
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer?.disconnect();
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("scroll", measure, true);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!backendReady) return;
+    const reactFlowElement = canvasRef.current?.querySelector<HTMLElement>(".react-flow");
+    if (!reactFlowElement) return;
+    const handlePointerMove = (event: PointerEvent) => {
+      if (!event.isPrimary || event.pointerType === "touch") return;
+      const point = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+      if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
+      queuePresencePoint({ x: point.x, y: point.y });
+    };
+    reactFlowElement.addEventListener("pointermove", handlePointerMove, { passive: true });
+    reactFlowElement.addEventListener("pointerleave", removePresence);
+    reactFlowElement.addEventListener("pointercancel", removePresence);
+    return () => {
+      reactFlowElement.removeEventListener("pointermove", handlePointerMove);
+      reactFlowElement.removeEventListener("pointerleave", removePresence);
+      reactFlowElement.removeEventListener("pointercancel", removePresence);
+      removePresence();
+    };
+  }, [backendReady, flow, queuePresencePoint, removePresence]);
+
+  useEffect(() => {
+    if (!backendReady) return;
+    const heartbeat = window.setInterval(() => {
+      const point = presenceLastPointRef.current;
+      if (
+        point &&
+        document.visibilityState === "visible" &&
+        Date.now() - presenceLastSentAtRef.current >= PRESENCE_HEARTBEAT_MS - PRESENCE_SEND_THROTTLE_MS
+      ) {
+        sendPresencePoint(point);
+      }
+    }, PRESENCE_HEARTBEAT_MS);
+    return () => window.clearInterval(heartbeat);
+  }, [backendReady, sendPresencePoint]);
+
+  useEffect(() => {
+    if (!backendReady) return;
+    let stopped = false;
+    let pollTimer = 0;
+    let pollController: AbortController | null = null;
+    let retryDelay = PRESENCE_POLL_MS;
+
+    const schedulePoll = (delay: number) => {
+      window.clearTimeout(pollTimer);
+      if (stopped || document.visibilityState !== "visible") return;
+      pollTimer = window.setTimeout(() => void poll(), delay);
+    };
+    const poll = async () => {
+      if (stopped || document.visibilityState !== "visible") return;
+      const requestId = presenceRequestRef.current + 1;
+      presenceRequestRef.current = requestId;
+      pollController = new AbortController();
+      try {
+        const response = await fetch("/api/presence", { cache: "no-store", signal: pollController.signal });
+        if (!response.ok) throw new Error("Presence unavailable");
+        const payload = (await response.json()) as { cursors?: unknown; serverTime?: unknown };
+        if (!Array.isArray(payload.cursors)) throw new Error("Invalid presence response");
+        if (stopped || presenceRequestRef.current !== requestId || document.visibilityState !== "visible") return;
+        const nextCursors = payload.cursors.filter(isPresenceCursor);
+        setPresenceCursors((current) => presenceCursorsEqual(current, nextCursors) ? current : nextCursors);
+        setPresenceStatus("live");
+        retryDelay = PRESENCE_POLL_MS;
+      } catch (error) {
+        if (stopped || presenceRequestRef.current !== requestId || (error instanceof DOMException && error.name === "AbortError")) return;
+        setPresenceCursors((current) => current.length === 0 ? current : []);
+        setPresenceStatus("offline");
+        retryDelay = Math.min(PRESENCE_RETRY_MAX_MS, retryDelay * 2);
+      } finally {
+        pollController = null;
+        if (!stopped) schedulePoll(retryDelay);
+      }
+    };
+    const startPolling = () => {
+      if (stopped || document.visibilityState !== "visible") return;
+      retryDelay = PRESENCE_POLL_MS;
+      setPresenceStatus("connecting");
+      schedulePoll(0);
+    };
+    const handleVisibilityChange = () => {
+      presenceRequestRef.current += 1;
+      pollController?.abort();
+      window.clearTimeout(pollTimer);
+      if (document.visibilityState === "hidden") {
+        removePresence();
+        setPresenceCursors((current) => current.length === 0 ? current : []);
+        setPresenceStatus("idle");
+      } else {
+        startPolling();
+      }
+    };
+
+    const initialStart = window.setTimeout(startPolling, 0);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      stopped = true;
+      presenceRequestRef.current += 1;
+      window.clearTimeout(initialStart);
+      window.clearTimeout(pollTimer);
+      pollController?.abort();
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [backendReady, removePresence]);
+
+  useEffect(() => {
+    const handlePageExit = () => removePresence();
+    window.addEventListener("pagehide", handlePageExit);
+    window.addEventListener("beforeunload", handlePageExit);
+    return () => {
+      window.removeEventListener("pagehide", handlePageExit);
+      window.removeEventListener("beforeunload", handlePageExit);
+      removePresence();
+    };
+  }, [removePresence]);
 
   const handleNodesChange = useCallback((changes: NodeChange<DiagramNode>[]) => {
     onNodesChange(changes);
@@ -2134,24 +2455,12 @@ function Workspace() {
             />
           </ReactFlow>
 
-          {members.length > 1 && (
-            <>
-              <div className="presence-cursor" style={{ left: "66%", top: "29%", color: members[1]?.color ?? "#9c83ff" }} aria-hidden="true">
-                <MousePointer2 size={17} fill="currentColor" />
-                <span className="presence-label" style={{ background: members[1]?.color ?? "#9c83ff" }}>
-                  {displayName(members[1])}
-                </span>
-              </div>
-              {members.length > 2 && (
-                <div className="presence-cursor" style={{ left: "48%", top: "67%", color: members[2]?.color ?? "#55d99a" }} aria-hidden="true">
-                  <MousePointer2 size={17} fill="currentColor" />
-                  <span className="presence-label" style={{ background: members[2]?.color ?? "#55d99a" }}>
-                    {displayName(members[2])}
-                  </span>
-                </div>
-              )}
-            </>
-          )}
+          <LivePresenceLayer
+            cursors={presenceCursors}
+            sessionId={presenceSessionId}
+            canvasBounds={canvasBounds}
+            status={presenceStatus}
+          />
 
           <div className="canvas-toolbar" aria-label="Canvas tools">
             <button className={`tool-btn ${canvasMode === "select" ? "active" : ""}`} onClick={() => setCanvasMode("select")} aria-label="Select tool" title="Select (V)">

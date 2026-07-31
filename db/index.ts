@@ -102,6 +102,22 @@ export function ensureProjectStorage() {
       d1.prepare(
         `CREATE INDEX IF NOT EXISTS "comments_parent_idx" ON "comments" ("parent_id")`,
       ),
+      d1.prepare(`CREATE TABLE IF NOT EXISTS "cursor_presence" (
+        "project_id" text NOT NULL,
+        "user_id" text NOT NULL,
+        "session_id" text NOT NULL,
+        "x" real NOT NULL,
+        "y" real NOT NULL,
+        "updated_at" text DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) NOT NULL,
+        PRIMARY KEY("project_id", "user_id", "session_id"),
+        FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+        FOREIGN KEY ("user_id") REFERENCES "users"("id") ON UPDATE no action ON DELETE cascade,
+        CONSTRAINT "cursor_presence_session_length_check" CHECK(length("session_id") between 8 and 64),
+        CONSTRAINT "cursor_presence_coordinates_check" CHECK("x" between -1000000 and 1000000 and "y" between -1000000 and 1000000)
+      )`),
+      d1.prepare(
+        `CREATE INDEX IF NOT EXISTS "cursor_presence_project_updated_idx" ON "cursor_presence" ("project_id", "updated_at")`,
+      ),
     ])
     .then(() => undefined)
     .catch((error: unknown) => {

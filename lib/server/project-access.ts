@@ -38,8 +38,30 @@ export async function requireExistingProjectAccess(
     throw new RouteError(401, "Sign in to access this project", "unauthenticated");
   }
 
-  const user = await upsertUser(identity);
   const db = getDb();
+  const email = normalizeEmail(identity.email);
+  const [existingAccess] = await db
+    .select({ project: projects, user: users, role: projectMembers.role })
+    .from(projects)
+    .innerJoin(projectMembers, eq(projectMembers.projectId, projects.id))
+    .innerJoin(users, eq(users.id, projectMembers.userId))
+    .where(and(eq(projects.id, projectId), eq(users.email, email)))
+    .limit(1);
+
+  if (existingAccess) {
+    const displayName = requestedDisplayName(identity, email);
+    if (existingAccess.user.displayName === displayName) return existingAccess;
+
+    const now = new Date().toISOString();
+    const [user] = await db
+      .update(users)
+      .set({ displayName, updatedAt: now })
+      .where(eq(users.id, existingAccess.user.id))
+      .returning();
+    return { ...existingAccess, user: user ?? existingAccess.user };
+  }
+
+  const user = await upsertUser(identity);
   const [project] = await db
     .select()
     .from(projects)
@@ -99,27 +121,39 @@ export async function getRequestIdentity(
 export async function upsertUser(identity: RequestIdentity): Promise<UserRow> {
   const db = getDb();
   const email = normalizeEmail(identity.email);
+  const displayName = requestedDisplayName(identity, email);
+  const [existing] = await db
+    .select()
+    .from(users)
+    .where(eq(users.email, email))
+    .limit(1);
+
+  if (existing?.displayName === displayName) return existing;
+
   const now = new Date().toISOString();
   const [user] = await db
     .insert(users)
     .values({
       id: crypto.randomUUID(),
       email,
-      displayName: identity.displayName.trim() || displayNameFromEmail(email),
+      displayName,
       createdAt: now,
       updatedAt: now,
     })
     .onConflictDoUpdate({
       target: users.email,
       set: {
-        displayName:
-          identity.displayName.trim() || displayNameFromEmail(email),
+        displayName,
         updatedAt: now,
       },
     })
     .returning();
 
   return user;
+}
+
+function requestedDisplayName(identity: RequestIdentity, email: string) {
+  return identity.displayName.trim() || displayNameFromEmail(email);
 }
 
 export function requireRole(actual: ProjectRole, allowed: ProjectRole[]) {

@@ -4,6 +4,7 @@ import {
   check,
   index,
   primaryKey,
+  real,
   sqliteTable,
   text,
   uniqueIndex,
@@ -128,6 +129,39 @@ export const comments = sqliteTable(
     check(
       "comments_body_length_check",
       sql`length(trim(${table.body})) between 1 and 2000`,
+    ),
+  ],
+);
+
+export const cursorPresence = sqliteTable(
+  "cursor_presence",
+  {
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    sessionId: text("session_id").notNull(),
+    x: real("x").notNull(),
+    y: real("y").notNull(),
+    updatedAt: text("updated_at").notNull().default(isoTimestamp),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.projectId, table.userId, table.sessionId],
+    }),
+    index("cursor_presence_project_updated_idx").on(
+      table.projectId,
+      table.updatedAt,
+    ),
+    check(
+      "cursor_presence_session_length_check",
+      sql`length(${table.sessionId}) between 8 and 64`,
+    ),
+    check(
+      "cursor_presence_coordinates_check",
+      sql`${table.x} between -1000000 and 1000000 and ${table.y} between -1000000 and 1000000`,
     ),
   ],
 );

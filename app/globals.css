@@ -1260,11 +1260,22 @@ select:focus-visible,
   fill: color-mix(in srgb, var(--bg) 55%, transparent);
 }
 
+.presence-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 29;
+  overflow: hidden;
+  pointer-events: none;
+}
+
 .presence-cursor {
   position: absolute;
-  z-index: 30;
+  top: 0;
+  left: 0;
   pointer-events: none;
-  transform: translate(-2px, -2px);
+  transform: translate3d(calc(var(--presence-x, 0px) - 2px), calc(var(--presence-y, 0px) - 2px), 0);
+  transition: transform 160ms linear, opacity 120ms ease;
+  will-change: transform;
 }
 
 .presence-cursor svg {
@@ -1274,12 +1285,66 @@ select:focus-visible,
 .presence-label {
   display: block;
   width: max-content;
+  max-width: 150px;
+  overflow: hidden;
   margin: -1px 0 0 12px;
   padding: 3px 6px;
   border-radius: 4px;
   color: #081016;
   font-size: 8px;
   font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.presence-live-status {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  position: absolute;
+  bottom: 16px;
+  left: 16px;
+  z-index: 30;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  box-shadow: var(--shadow-float);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 8px;
+  pointer-events: none;
+  backdrop-filter: blur(12px);
+  transition: opacity 140ms ease, border-color 140ms ease;
+}
+
+.presence-live-status.idle {
+  opacity: 0;
+}
+
+.presence-live-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 11%, transparent);
+}
+
+.presence-live-status.connecting .presence-live-dot {
+  background: var(--warning);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning) 11%, transparent);
+  animation: presence-pulse 1.1s ease-in-out infinite;
+}
+
+.presence-live-status.offline {
+  border-color: color-mix(in srgb, var(--danger) 24%, var(--line));
+}
+
+.presence-live-status.offline .presence-live-dot {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 9%, transparent);
 }
 
 .inspector {
@@ -2412,6 +2477,13 @@ select:focus-visible,
   }
 }
 
+@keyframes presence-pulse {
+  50% {
+    opacity: 0.42;
+    transform: scale(0.78);
+  }
+}
+
 @media (prefers-reduced-motion: no-preference) {
   body,
   .relix-app,
@@ -2571,6 +2643,13 @@ select:focus-visible,
     display: none;
   }
 
+  .presence-live-status {
+    top: 54px;
+    right: 10px;
+    bottom: auto;
+    left: auto;
+  }
+
   .inspector {
     height: 100%;
   }
@@ -2657,6 +2736,12 @@ select:focus-visible,
   }
 }
 
+@media (hover: none), (pointer: coarse) {
+  .presence-layer {
+    display: none;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -2665,5 +2750,9 @@ select:focus-visible,
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+  }
+
+  .presence-cursor {
+    transition: none !important;
   }
 }
