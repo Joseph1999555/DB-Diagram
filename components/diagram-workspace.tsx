@@ -20,10 +20,12 @@ import {
 } from "@xyflow/react";
 import {
   ArrowDownToLine,
+  ArrowLeft,
   ArrowLeftRight,
   Boxes,
   Braces,
   Check,
+  CheckCircle2,
   ChevronRight,
   Clock3,
   Code2,
@@ -44,6 +46,7 @@ import {
   LockKeyhole,
   LoaderCircle,
   Maximize2,
+  MessageSquare,
   MousePointer2,
   PanelLeftClose,
   PanelLeftOpen,
@@ -51,7 +54,10 @@ import {
   PanelRightOpen,
   Plus,
   Redo2,
+  RefreshCw,
+  RotateCcw,
   Search,
+  Send,
   Settings2,
   Share2,
   Sparkles,
@@ -65,6 +71,13 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { ThemeSwitcher } from "@/components/theme-switcher";
+import {
+  buildCommentThreads,
+  COMMENT_BODY_MAX_LENGTH,
+  type CommentStatus,
+  type CommentThread,
+  type ProjectComment,
+} from "@/lib/comments";
 import {
   parseDBML,
   type DbmlDocument,
@@ -201,6 +214,8 @@ type TableNodeData = Record<string, unknown> & {
   color: string;
   dimmed: boolean;
   foreignFieldIds: ReadonlySet<string>;
+  openCommentCount?: number;
+  onOpenComments?: (tableId: string) => void;
 };
 
 type GroupNodeData = Record<string, unknown> & {
@@ -221,6 +236,7 @@ type Member = {
 };
 
 type CurrentUser = {
+  id?: string;
   email: string;
   displayName?: string;
   name?: string;
@@ -231,6 +247,8 @@ type ModalName = "import" | "export" | "share" | "command" | null;
 type EditorTab = "dbml" | "outline" | "history";
 type CanvasMode = "select" | "pan";
 type SaveStatus = "saved" | "syncing" | "offline";
+type CommentScope = "all" | "diagram" | "table";
+type InspectorMode = "details" | "comments";
 
 function defaultPosition(name: string, index: number) {
   const known: Record<string, { x: number; y: number }> = {
@@ -326,13 +344,15 @@ function tableNodePropsEqual(previous: NodeProps, next: NodeProps) {
     previousData.table === nextData.table &&
     previousData.color === nextData.color &&
     previousData.dimmed === nextData.dimmed &&
-    previousData.foreignFieldIds === nextData.foreignFieldIds
+    previousData.foreignFieldIds === nextData.foreignFieldIds &&
+    previousData.openCommentCount === nextData.openCommentCount &&
+    previousData.onOpenComments === nextData.onOpenComments
   );
 }
 
 const TableNodeCard = memo(function TableNodeCard({ data, selected }: NodeProps) {
   const nodeData = data as TableNodeData;
-  const { table, color, dimmed, foreignFieldIds } = nodeData;
+  const { table, color, dimmed, foreignFieldIds, openCommentCount = 0, onOpenComments } = nodeData;
 
   return (
     <div
@@ -343,6 +363,22 @@ const TableNodeCard = memo(function TableNodeCard({ data, selected }: NodeProps)
       <div className="table-header">
         <Table2 className="table-icon" size={13} strokeWidth={1.8} aria-hidden="true" />
         <span className="table-name">{table.name}</span>
+        <button
+          className={`table-comment-trigger nodrag nopan${openCommentCount > 0 ? " has-comments" : ""}`}
+          type="button"
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpenComments?.(table.id);
+          }}
+          aria-label={openCommentCount > 0
+            ? `Open ${openCommentCount} comment ${openCommentCount === 1 ? "thread" : "threads"} for ${table.name}`
+            : `Comment on ${table.name}`}
+          title={openCommentCount > 0 ? `${openCommentCount} open comment ${openCommentCount === 1 ? "thread" : "threads"}` : "Comment on table"}
+        >
+          <MessageSquare size={11} aria-hidden="true" />
+          {openCommentCount > 0 && <span>{openCommentCount > 99 ? "99+" : openCommentCount}</span>}
+        </button>
         <span className="table-count">{table.fields.length}</span>
       </div>
       <div>
@@ -426,6 +462,330 @@ function displayName(member: Member | CurrentUser) {
   return member.displayName ?? member.name ?? member.email.split("@")[0];
 }
 
+function commentTargetLabel(comment: ProjectComment, tables: DbmlTable[]) {
+  if (comment.targetType === "diagram") return comment.targetLabel || "Diagram";
+  const table = tables.find((candidate) => candidate.id === comment.targetId);
+  return table?.name ?? comment.targetLabel ?? "Former table";
+}
+
+function commentAvatarColor(id: string) {
+  let hash = 0;
+  for (let index = 0; index < id.length; index += 1) hash = (hash * 31 + id.charCodeAt(index)) | 0;
+  return GROUP_PALETTE[Math.abs(hash) % GROUP_PALETTE.length];
+}
+
+function formatCommentTime(value: string) {
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return "Now";
+  const seconds = Math.round((timestamp - Date.now()) / 1000);
+  const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  if (Math.abs(seconds) < 60) return formatter.format(seconds, "second");
+  const minutes = Math.round(seconds / 60);
+  if (Math.abs(minutes) < 60) return formatter.format(minutes, "minute");
+  const hours = Math.round(minutes / 60);
+  if (Math.abs(hours) < 24) return formatter.format(hours, "hour");
+  const days = Math.round(hours / 24);
+  if (Math.abs(days) < 30) return formatter.format(days, "day");
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" }).format(timestamp);
+}
+
+function formatCommentDate(value: string) {
+  const timestamp = new Date(value);
+  return Number.isFinite(timestamp.getTime())
+    ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(timestamp)
+    : value;
+}
+
+function latestThreadActivity(thread: CommentThread) {
+  return thread.replies[thread.replies.length - 1]?.createdAt ?? thread.updatedAt ?? thread.createdAt;
+}
+
+function mergeServerComment(comments: ProjectComment[], comment: ProjectComment) {
+  const existing = comments.findIndex((candidate) => candidate.id === comment.id);
+  if (existing < 0) return [...comments, comment];
+  const next = [...comments];
+  next[existing] = comment;
+  return next;
+}
+
+async function commentResponseError(response: Response, fallback: string) {
+  try {
+    const payload = (await response.json()) as { error?: unknown };
+    return typeof payload.error === "string" && payload.error ? payload.error : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+type CommentsPanelProps = {
+  threads: CommentThread[];
+  tables: DbmlTable[];
+  selectedTable: DbmlTable | null;
+  scope: CommentScope;
+  filter: CommentStatus;
+  activeThreadId: string | null;
+  rootDraft: string;
+  replyDraft: string;
+  loading: boolean;
+  loaded: boolean;
+  error: string | null;
+  composerError: string | null;
+  pendingAction: string | null;
+  onScopeChange: (scope: CommentScope) => void;
+  onFilterChange: (filter: CommentStatus) => void;
+  onOpenThread: (threadId: string) => void;
+  onBack: () => void;
+  onRootDraftChange: (value: string) => void;
+  onReplyDraftChange: (value: string) => void;
+  onSubmitRoot: () => void;
+  onSubmitReply: (threadId: string) => void;
+  onToggleStatus: (thread: CommentThread) => void;
+  onRetry: () => void;
+};
+
+function CommentsPanel({
+  threads,
+  tables,
+  selectedTable,
+  scope,
+  filter,
+  activeThreadId,
+  rootDraft,
+  replyDraft,
+  loading,
+  loaded,
+  error,
+  composerError,
+  pendingAction,
+  onScopeChange,
+  onFilterChange,
+  onOpenThread,
+  onBack,
+  onRootDraftChange,
+  onReplyDraftChange,
+  onSubmitRoot,
+  onSubmitReply,
+  onToggleStatus,
+  onRetry,
+}: CommentsPanelProps) {
+  const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? null;
+  const scopedThreads = useMemo(() => threads.filter((thread) => {
+    if (scope === "diagram") return thread.targetType === "diagram";
+    if (scope === "table") return Boolean(selectedTable && thread.targetType === "table" && thread.targetId === selectedTable.id);
+    return true;
+  }), [scope, selectedTable, threads]);
+  const openCount = scopedThreads.filter((thread) => thread.status === "open").length;
+  const resolvedCount = scopedThreads.length - openCount;
+  const visibleThreads = useMemo(
+    () => scopedThreads
+      .filter((thread) => thread.status === filter)
+      .sort((left, right) => latestThreadActivity(right).localeCompare(latestThreadActivity(left))),
+    [filter, scopedThreads],
+  );
+  const composerTarget = scope === "table" && selectedTable ? selectedTable.name : "the diagram";
+  const submittingRoot = pendingAction === "root";
+
+  if (activeThread) {
+    const targetLabel = commentTargetLabel(activeThread, tables);
+    const isOrphaned = activeThread.targetType === "table" && activeThread.targetExists === false;
+    const changingStatus = pendingAction === `status:${activeThread.id}`;
+    const submittingReply = pendingAction === `reply:${activeThread.id}`;
+    const messages = [activeThread, ...activeThread.replies];
+
+    return (
+      <div className="comments-panel thread-view" aria-busy={loading || Boolean(pendingAction)}>
+        <div className="comment-thread-toolbar">
+          <button className="comment-back-btn" type="button" onClick={onBack} aria-label="Back to comment threads">
+            <ArrowLeft size={14} aria-hidden="true" />
+          </button>
+          <div className={`comment-target-label${isOrphaned ? " orphaned" : ""}`}>
+            {isOrphaned ? "Former table" : activeThread.targetType === "diagram" ? "Diagram" : "Table"}
+            <strong>{targetLabel}</strong>
+          </div>
+          {activeThread.canResolve ? (
+            <button
+              className="comment-status-action"
+              type="button"
+              onClick={() => onToggleStatus(activeThread)}
+              disabled={changingStatus}
+            >
+              {changingStatus ? <LoaderCircle className="spin" size={12} aria-hidden="true" /> : activeThread.status === "open" ? <CheckCircle2 size={12} aria-hidden="true" /> : <RotateCcw size={12} aria-hidden="true" />}
+              {activeThread.status === "open" ? "Resolve" : "Reopen"}
+            </button>
+          ) : (
+            <span className={`comment-status-chip ${activeThread.status}`}>
+              {activeThread.status === "open" ? "Open" : "Resolved"}
+            </span>
+          )}
+        </div>
+
+        {isOrphaned && <div className="comment-orphan-note">This table no longer exists. The discussion is preserved.</div>}
+
+        <div className="comment-messages" role="feed" aria-label={`Discussion about ${targetLabel}`}>
+          {messages.map((message, index) => (
+            <article className={`comment-message${index === 0 ? " root" : ""}`} key={message.id}>
+              <div className="comment-avatar" style={{ background: commentAvatarColor(message.author.id) }} aria-hidden="true">
+                {initials(message.author.displayName)}
+              </div>
+              <div className="comment-message-content">
+                <div className="comment-message-meta">
+                  <strong>{message.author.displayName}</strong>
+                  <time dateTime={message.createdAt} title={formatCommentDate(message.createdAt)}>{formatCommentTime(message.createdAt)}</time>
+                </div>
+                <p>{message.body}</p>
+              </div>
+            </article>
+          ))}
+        </div>
+
+        {activeThread.status === "resolved" ? (
+          <div className="comment-resolved-note" role="status">
+            <CheckCircle2 size={14} aria-hidden="true" />
+            This thread is resolved.
+          </div>
+        ) : (
+          <form
+            className="comment-composer reply-composer"
+            onSubmit={(event) => {
+              event.preventDefault();
+              onSubmitReply(activeThread.id);
+            }}
+          >
+            <label htmlFor="comment-reply">Reply to this thread</label>
+            <textarea
+              id="comment-reply"
+              value={replyDraft}
+              onChange={(event) => onReplyDraftChange(event.target.value)}
+              onKeyDown={(event) => {
+                if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                  event.preventDefault();
+                  onSubmitReply(activeThread.id);
+                }
+              }}
+              placeholder="Reply to this thread..."
+              maxLength={COMMENT_BODY_MAX_LENGTH}
+              aria-describedby={composerError ? "comment-composer-error" : undefined}
+            />
+            <div className="comment-composer-footer">
+              <span>{replyDraft.length}/{COMMENT_BODY_MAX_LENGTH}</span>
+              <button className="comment-submit-btn" type="submit" disabled={!replyDraft.trim() || submittingReply}>
+                {submittingReply ? <LoaderCircle className="spin" size={12} aria-hidden="true" /> : <Send size={12} aria-hidden="true" />}
+                Reply
+              </button>
+            </div>
+          </form>
+        )}
+        {composerError && <div className="comment-composer-error thread-action-error" id="comment-composer-error" role="alert">{composerError}</div>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="comments-panel" aria-busy={loading || Boolean(pendingAction)}>
+      <div className="comment-scope-row" role="group" aria-label="Comment scope">
+        <button className={scope === "all" ? "active" : ""} type="button" onClick={() => onScopeChange("all")} aria-pressed={scope === "all"}>All</button>
+        <button className={scope === "diagram" ? "active" : ""} type="button" onClick={() => onScopeChange("diagram")} aria-pressed={scope === "diagram"}>Diagram</button>
+        {selectedTable && (
+          <button className={scope === "table" ? "active" : ""} type="button" onClick={() => onScopeChange("table")} aria-pressed={scope === "table"} title={selectedTable.name}>
+            <Table2 size={10} aria-hidden="true" />
+            {selectedTable.name}
+          </button>
+        )}
+      </div>
+
+      <div className="comment-filter-row" role="tablist" aria-label="Comment status">
+        <button className={filter === "open" ? "active" : ""} type="button" role="tab" aria-selected={filter === "open"} onClick={() => onFilterChange("open")}>Open <span>{openCount}</span></button>
+        <button className={filter === "resolved" ? "active" : ""} type="button" role="tab" aria-selected={filter === "resolved"} onClick={() => onFilterChange("resolved")}>Resolved <span>{resolvedCount}</span></button>
+        <button className="comment-refresh-btn" type="button" onClick={onRetry} disabled={loading} aria-label="Refresh comments" title="Refresh comments">
+          <RefreshCw className={loading ? "spin" : ""} size={12} aria-hidden="true" />
+        </button>
+      </div>
+
+      <div className="comment-thread-scroll">
+        {!loaded && loading ? (
+          <div className="comment-loading" role="status"><LoaderCircle className="spin" size={16} aria-hidden="true" />Loading comments...</div>
+        ) : !loaded && error ? (
+          <div className="comment-empty error-state">
+            <MessageSquare size={20} aria-hidden="true" />
+            <strong>Comments couldn&apos;t load</strong>
+            <span>{error}</span>
+            <button className="text-btn" type="button" onClick={onRetry}>Try again</button>
+          </div>
+        ) : visibleThreads.length === 0 ? (
+          <div className="comment-empty">
+            {filter === "resolved" ? <CheckCircle2 size={20} aria-hidden="true" /> : <MessageSquare size={20} aria-hidden="true" />}
+            <strong>{filter === "resolved" ? "No resolved threads yet." : scope === "table" && selectedTable ? `No comments on ${selectedTable.name} yet.` : "No open comments."}</strong>
+            {filter === "open" && <span>{scope === "table" ? "Start a focused discussion below." : "The diagram is ready for review."}</span>}
+          </div>
+        ) : (
+          <ol className="comment-thread-list" aria-label={`${filter === "open" ? "Open" : "Resolved"} comment threads`}>
+            {visibleThreads.map((thread) => {
+              const targetLabel = commentTargetLabel(thread, tables);
+              const isOrphaned = thread.targetType === "table" && thread.targetExists === false;
+              return (
+                <li key={thread.id}>
+                  <button className="comment-thread-card" type="button" onClick={() => onOpenThread(thread.id)}>
+                    <div className="comment-thread-card-head">
+                      <span className={`comment-target-pill${isOrphaned ? " orphaned" : ""}`}>{isOrphaned ? "Former table" : thread.targetType === "diagram" ? "Diagram" : targetLabel}</span>
+                      <time dateTime={latestThreadActivity(thread)} title={formatCommentDate(latestThreadActivity(thread))}>{formatCommentTime(latestThreadActivity(thread))}</time>
+                    </div>
+                    <div className="comment-thread-author">
+                      <span className="comment-avatar small" style={{ background: commentAvatarColor(thread.author.id) }} aria-hidden="true">{initials(thread.author.displayName)}</span>
+                      <strong>{thread.author.displayName}</strong>
+                    </div>
+                    <p>{thread.body}</p>
+                    <div className="comment-thread-card-foot">
+                      <MessageSquare size={11} aria-hidden="true" />
+                      {thread.replies.length === 0 ? "No replies" : `${thread.replies.length} ${thread.replies.length === 1 ? "reply" : "replies"}`}
+                      {thread.status === "resolved" && <span className="resolved"><CheckCircle2 size={10} aria-hidden="true" />Resolved</span>}
+                    </div>
+                  </button>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+        {loaded && error && <div className="comment-stale-note" role="status">Couldn&apos;t refresh comments. Showing the last update.</div>}
+      </div>
+
+      <form
+        className="comment-composer"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSubmitRoot();
+        }}
+      >
+        <div className="comment-composer-heading">
+          <label htmlFor="new-comment">Start a thread</label>
+          <span>On {composerTarget}</span>
+        </div>
+        <textarea
+          id="new-comment"
+          value={rootDraft}
+          onChange={(event) => onRootDraftChange(event.target.value)}
+          onKeyDown={(event) => {
+            if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+              event.preventDefault();
+              onSubmitRoot();
+            }
+          }}
+          placeholder={scope === "table" && selectedTable ? `Comment on ${selectedTable.name}...` : "Comment on the diagram..."}
+          maxLength={COMMENT_BODY_MAX_LENGTH}
+          aria-describedby={composerError ? "comment-composer-error" : undefined}
+        />
+        <div className="comment-composer-footer">
+          <span>{rootDraft.length}/{COMMENT_BODY_MAX_LENGTH} / Ctrl/Cmd + Enter</span>
+          <button className="comment-submit-btn" type="submit" disabled={!rootDraft.trim() || submittingRoot}>
+            {submittingRoot ? <LoaderCircle className="spin" size={12} aria-hidden="true" /> : <Send size={12} aria-hidden="true" />}
+            Comment
+          </button>
+        </div>
+        {composerError && <div className="comment-composer-error" id="comment-composer-error" role="alert">{composerError}</div>}
+      </form>
+    </div>
+  );
+}
+
 function downloadBlob(contents: BlobPart, mime: string, filename: string) {
   const url = URL.createObjectURL(new Blob([contents], { type: mime }));
   const anchor = document.createElement("a");
@@ -487,6 +847,7 @@ function Workspace() {
   const canvasRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const lineNumbersRef = useRef<HTMLPreElement>(null);
+  const commentsHeadingRef = useRef<HTMLSpanElement>(null);
   const historySkipRef = useRef(false);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flow = useReactFlow<DiagramNode>();
@@ -502,6 +863,7 @@ function Workspace() {
   const [activeGroup, setActiveGroup] = useState("all");
   const [editorOpen, setEditorOpen] = useState(true);
   const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [inspectorMode, setInspectorMode] = useState<InspectorMode>("details");
   const [editorTab, setEditorTab] = useState<EditorTab>("dbml");
   const [canvasMode, setCanvasMode] = useState<CanvasMode>("select");
   const [modal, setModal] = useState<ModalName>(null);
@@ -527,11 +889,23 @@ function Workspace() {
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState("editor");
   const [toast, setToast] = useState<string | null>(null);
+  const [comments, setComments] = useState<ProjectComment[]>([]);
+  const [commentsLoaded, setCommentsLoaded] = useState(false);
+  const [commentsLoading, setCommentsLoading] = useState(false);
+  const [commentsError, setCommentsError] = useState<string | null>(null);
+  const [commentComposerError, setCommentComposerError] = useState<string | null>(null);
+  const [commentScope, setCommentScope] = useState<CommentScope>("all");
+  const [commentFilter, setCommentFilter] = useState<CommentStatus>("open");
+  const [activeCommentThreadId, setActiveCommentThreadId] = useState<string | null>(null);
+  const [rootCommentDraft, setRootCommentDraft] = useState("");
+  const [replyCommentDraft, setReplyCommentDraft] = useState("");
+  const [commentPendingAction, setCommentPendingAction] = useState<string | null>(null);
   const [historyEntries, setHistoryEntries] = useState<string[]>([DEFAULT_DBML]);
   const [historyIndex, setHistoryIndex] = useState(0);
   const nodesRef = useRef(nodes);
   const documentModelRef = useRef(documentModel);
   const layoutRequestRef = useRef(0);
+  const commentsRequestRef = useRef(0);
 
   const stats = useMemo(() => diagramStats(documentModel), [documentModel]);
   const editorLineNumbers = useMemo(
@@ -715,6 +1089,171 @@ function Workspace() {
     [documentModel.relations, selectedRelationId],
   );
 
+  const loadComments = useCallback(async (silent = false) => {
+    const requestId = commentsRequestRef.current + 1;
+    commentsRequestRef.current = requestId;
+    if (!silent) setCommentsLoading(true);
+    try {
+      const response = await fetch("/api/comments", { cache: "no-store" });
+      if (!response.ok) throw new Error(await commentResponseError(response, "Comments are temporarily unavailable."));
+      const payload = (await response.json()) as { comments?: unknown };
+      if (!Array.isArray(payload.comments)) throw new Error("The comments response was incomplete.");
+      if (commentsRequestRef.current !== requestId) return;
+      setComments(payload.comments as ProjectComment[]);
+      setCommentsLoaded(true);
+      setCommentsError(null);
+    } catch (error) {
+      if (commentsRequestRef.current !== requestId) return;
+      setCommentsError(error instanceof Error ? error.message : "Comments are temporarily unavailable.");
+    } finally {
+      if (commentsRequestRef.current === requestId) setCommentsLoading(false);
+    }
+  }, []);
+
+  const commentThreads = useMemo(() => buildCommentThreads(comments), [comments]);
+  const openCommentThreads = useMemo(
+    () => commentThreads.filter((thread) => thread.status === "open"),
+    [commentThreads],
+  );
+  const tableOpenCommentCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const thread of openCommentThreads) {
+      if (thread.targetType === "table" && thread.targetId) {
+        counts.set(thread.targetId, (counts.get(thread.targetId) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }, [openCommentThreads]);
+
+  const openComments = useCallback((scope: CommentScope = "all", tableId?: string) => {
+    if (tableId) {
+      setSelectedTableId(tableId);
+      setSelectedRelationId(null);
+      setCommentScope("table");
+    } else {
+      setCommentScope(scope);
+    }
+    setCommentFilter("open");
+    setActiveCommentThreadId(null);
+    setCommentComposerError(null);
+    setInspectorMode("comments");
+    setInspectorOpen(true);
+    if (window.matchMedia("(max-width: 780px)").matches) setEditorOpen(false);
+  }, []);
+
+  const openTableComments = useCallback((tableId: string) => {
+    openComments("table", tableId);
+  }, [openComments]);
+
+  const submitRootComment = useCallback(async () => {
+    const body = rootCommentDraft.trim();
+    if (!body || commentPendingAction) return;
+    const useTableTarget = commentScope === "table" && Boolean(selectedTable);
+    setCommentPendingAction("root");
+    setCommentComposerError(null);
+    try {
+      const response = await fetch("/api/comments", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          body,
+          targetType: useTableTarget ? "table" : "diagram",
+          targetId: useTableTarget ? selectedTable?.id : null,
+        }),
+      });
+      if (!response.ok) throw new Error(await commentResponseError(response, "Couldn't post your comment. Try again."));
+      const payload = (await response.json()) as { comment?: ProjectComment };
+      if (!payload.comment) throw new Error("Couldn't post your comment. Try again.");
+      setComments((current) => mergeServerComment(current, payload.comment as ProjectComment));
+      setRootCommentDraft("");
+      setCommentFilter("open");
+      setActiveCommentThreadId(payload.comment.id);
+      showToast("Comment posted");
+    } catch (error) {
+      setCommentComposerError(error instanceof Error ? error.message : "Couldn't post your comment. Try again.");
+    } finally {
+      setCommentPendingAction(null);
+    }
+  }, [commentPendingAction, commentScope, rootCommentDraft, selectedTable, showToast]);
+
+  const submitReplyComment = useCallback(async (threadId: string) => {
+    const body = replyCommentDraft.trim();
+    if (!body || commentPendingAction) return;
+    setCommentPendingAction(`reply:${threadId}`);
+    setCommentComposerError(null);
+    try {
+      const response = await fetch("/api/comments", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ body, parentId: threadId }),
+      });
+      if (!response.ok) throw new Error(await commentResponseError(response, "Couldn't post your reply. Try again."));
+      const payload = (await response.json()) as { comment?: ProjectComment };
+      if (!payload.comment) throw new Error("Couldn't post your reply. Try again.");
+      setComments((current) => mergeServerComment(current, payload.comment as ProjectComment));
+      setReplyCommentDraft("");
+      showToast("Reply posted");
+    } catch (error) {
+      setCommentComposerError(error instanceof Error ? error.message : "Couldn't post your reply. Try again.");
+    } finally {
+      setCommentPendingAction(null);
+    }
+  }, [commentPendingAction, replyCommentDraft, showToast]);
+
+  const toggleCommentStatus = useCallback(async (thread: CommentThread) => {
+    if (commentPendingAction) return;
+    const status: CommentStatus = thread.status === "open" ? "resolved" : "open";
+    setCommentPendingAction(`status:${thread.id}`);
+    setCommentComposerError(null);
+    try {
+      const response = await fetch("/api/comments", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: thread.id, status }),
+      });
+      if (!response.ok) throw new Error(await commentResponseError(response, `Couldn't ${status === "resolved" ? "resolve" : "reopen"} this thread.`));
+      const payload = (await response.json()) as { comment?: ProjectComment };
+      if (!payload.comment) throw new Error(`Couldn't ${status === "resolved" ? "resolve" : "reopen"} this thread.`);
+      setComments((current) => mergeServerComment(current, payload.comment as ProjectComment));
+      showToast(status === "resolved" ? "Thread resolved" : "Thread reopened");
+    } catch (error) {
+      setCommentComposerError(error instanceof Error ? error.message : "Couldn't update this thread.");
+    } finally {
+      setCommentPendingAction(null);
+    }
+  }, [commentPendingAction, showToast]);
+
+  useEffect(() => {
+    if (!backendReady || commentsLoaded) return;
+    const timer = window.setTimeout(() => void loadComments(true), 0);
+    return () => window.clearTimeout(timer);
+  }, [backendReady, commentsLoaded, loadComments]);
+
+  useEffect(() => {
+    if (!(inspectorOpen && inspectorMode === "comments")) return;
+    const refresh = () => {
+      if (document.visibilityState === "visible") void loadComments(true);
+    };
+    const initialRefresh = window.setTimeout(refresh, 0);
+    const timer = window.setInterval(refresh, 15000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.clearTimeout(initialRefresh);
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [inspectorMode, inspectorOpen, loadComments]);
+
+  useEffect(() => {
+    if (!(inspectorOpen && inspectorMode === "comments")) return;
+    const frame = window.requestAnimationFrame(() => commentsHeadingRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [inspectorMode, inspectorOpen]);
+
+  const effectiveCommentScope: CommentScope = commentScope === "table" && !selectedTable ? "diagram" : commentScope;
+
   const connectedTableIds = useMemo(() => {
     const connected = new Set<string>();
     if (selectedRelation) {
@@ -749,17 +1288,19 @@ function Workspace() {
       const tableData = node.data as TableNodeData;
       const hidden = Boolean(activeTableIds && !activeTableIds.has(node.id));
       const dimmed = hasFocus && !connectedTableIds.has(node.id);
+      const openCommentCount = tableOpenCommentCounts.get(node.id) ?? 0;
       const sameHidden = Boolean(node.hidden) === hidden;
       const sameDimmed = tableData.dimmed === dimmed;
-      return sameHidden && sameDimmed
+      const sameComments = tableData.openCommentCount === openCommentCount && tableData.onOpenComments === openTableComments;
+      return sameHidden && sameDimmed && sameComments
         ? node
         : {
             ...node,
             hidden,
-            data: sameDimmed ? tableData : { ...tableData, dimmed },
+            data: { ...tableData, dimmed, openCommentCount, onOpenComments: openTableComments },
           };
     });
-  }, [activeGroup, activeGroupModel, connectedTableIds, nodes, selectedRelationId, selectedTableId]);
+  }, [activeGroup, activeGroupModel, connectedTableIds, nodes, openTableComments, selectedRelationId, selectedTableId, tableOpenCommentCounts]);
 
   const displayEdges = useMemo(() => {
     const hasFocus = Boolean(selectedTableId || selectedRelationId);
@@ -804,6 +1345,11 @@ function Workspace() {
       if (!node || node.type !== "tableCard") return;
       setSelectedTableId(tableId);
       setSelectedRelationId(null);
+      if (inspectorMode === "comments") {
+        setCommentScope("table");
+        setActiveCommentThreadId(null);
+        setCommentComposerError(null);
+      }
       setInspectorOpen(true);
       setModal(null);
       void flow.setCenter(node.position.x + TABLE_NODE_WIDTH / 2, node.position.y + tableNodeHeight((node.data as TableNodeData).table) / 2, {
@@ -811,7 +1357,7 @@ function Workspace() {
         duration: motionDuration(420),
       });
     },
-    [flow, nodes],
+    [flow, inspectorMode, nodes],
   );
 
   const fitDiagram = useCallback(() => {
@@ -913,7 +1459,7 @@ function Workspace() {
     function onKeyDown(event: KeyboardEvent) {
       const modifier = event.metaKey || event.ctrlKey;
       const target = event.target as HTMLElement | null;
-      const isTyping = target?.tagName === "TEXTAREA" || target?.tagName === "INPUT" || target?.tagName === "SELECT";
+      const isTyping = target?.tagName === "TEXTAREA" || target?.tagName === "INPUT" || target?.tagName === "SELECT" || target?.isContentEditable === true || Boolean(target?.closest('[role="textbox"]'));
 
       if (modifier && event.key.toLowerCase() === "k") {
         event.preventDefault();
@@ -928,9 +1474,32 @@ function Workspace() {
         return;
       }
       if (event.key === "Escape") {
+        if (modal) {
+          setModal(null);
+          return;
+        }
+        if (inspectorOpen && inspectorMode === "comments") {
+          if (isTyping) {
+            target?.blur();
+            return;
+          }
+          if (activeCommentThreadId) {
+            setActiveCommentThreadId(null);
+            setReplyCommentDraft("");
+            setCommentComposerError(null);
+            return;
+          }
+          setInspectorOpen(false);
+          return;
+        }
         setModal(null);
         setSelectedRelationId(null);
         setSelectedTableId(null);
+        return;
+      }
+      if (!isTyping && event.key.toLowerCase() === "c") {
+        event.preventDefault();
+        openComments(selectedTableId ? "table" : "all", selectedTableId ?? undefined);
         return;
       }
       if (!isTyping && event.key.toLowerCase() === "l") {
@@ -953,7 +1522,7 @@ function Workspace() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [applySmartLayout, fitDiagram, flow, saveProject, showToast]);
+  }, [activeCommentThreadId, applySmartLayout, fitDiagram, flow, inspectorMode, inspectorOpen, modal, openComments, saveProject, selectedTableId, showToast]);
 
   const exportDbml = useCallback(() => {
     downloadBlob(dbml, "text/plain;charset=utf-8", `${safeFileName(projectName)}.dbml`);
@@ -1186,6 +1755,7 @@ function Workspace() {
     const matches = (keywords: string) => !query || keywords.includes(query);
     return {
       add: matches("add create new table entity"),
+      comments: matches("comment comments review discuss discussion collaborate feedback"),
       layout: matches("smart auto layout arrange organize group relationship relation diagram"),
       fit: matches("fit center zoom view diagram canvas"),
       export: matches("export download schema dbml prisma mysql sqlite drizzle json"),
@@ -1274,6 +1844,11 @@ function Workspace() {
               </div>
             ))}
           </div>
+          <button className="text-btn hide-mobile comments-top-trigger" onClick={() => openComments("all")} aria-label={`Open comments${openCommentThreads.length > 0 ? `, ${openCommentThreads.length} open` : ""}`} title="Comments (C)">
+            <MessageSquare size={13} aria-hidden="true" />
+            <span className="action-label">Comments</span>
+            {openCommentThreads.length > 0 && <span className="comment-count-badge">{openCommentThreads.length > 99 ? "99+" : openCommentThreads.length}</span>}
+          </button>
           <button className="text-btn hide-mobile" onClick={() => setModal("import")}>
             <Import size={13} />
             <span className="action-label">Import</span>
@@ -1309,6 +1884,15 @@ function Workspace() {
             title="Schema outline and groups"
           >
             <Boxes size={17} />
+          </button>
+          <button
+            className={`rail-btn ${inspectorOpen && inspectorMode === "comments" ? "active" : ""}`}
+            onClick={() => (inspectorOpen && inspectorMode === "comments" ? setInspectorOpen(false) : openComments("all"))}
+            aria-label={`Comments${openCommentThreads.length > 0 ? `, ${openCommentThreads.length} open threads` : ""}`}
+            title="Comments (C)"
+          >
+            <MessageSquare size={17} aria-hidden="true" />
+            {openCommentThreads.length > 0 && <span className="rail-count-badge">{openCommentThreads.length > 9 ? "9+" : openCommentThreads.length}</span>}
           </button>
           <button
             className={`rail-btn ${editorOpen && editorTab === "history" ? "active" : ""}`}
@@ -1454,8 +2038,8 @@ function Workspace() {
             </button>
           )}
           {!inspectorOpen && (
-            <button className="icon-btn floating-open-panel right" onClick={() => setInspectorOpen(true)} aria-label="Open inspector" title="Open inspector">
-              <PanelRightOpen size={15} />
+            <button className="icon-btn floating-open-panel right" onClick={() => setInspectorOpen(true)} aria-label={inspectorMode === "comments" ? "Open comments" : "Open inspector"} title={inspectorMode === "comments" ? "Open comments" : "Open inspector"}>
+              {inspectorMode === "comments" ? <MessageSquare size={15} /> : <PanelRightOpen size={15} />}
             </button>
           )}
 
@@ -1497,16 +2081,31 @@ function Workspace() {
               if (node.type !== "tableCard") return;
               setSelectedTableId(node.id);
               setSelectedRelationId(null);
+              if (inspectorMode === "comments") {
+                setCommentScope("table");
+                setActiveCommentThreadId(null);
+                setCommentComposerError(null);
+              }
               setInspectorOpen(true);
             }}
             onEdgeClick={(_event, edge) => {
               setSelectedRelationId(edge.id);
               setSelectedTableId(null);
+              if (inspectorMode === "comments") {
+                setCommentScope("diagram");
+                setActiveCommentThreadId(null);
+                setCommentComposerError(null);
+              }
               setInspectorOpen(true);
             }}
             onPaneClick={() => {
               setSelectedTableId(null);
               setSelectedRelationId(null);
+              if (inspectorMode === "comments") {
+                setCommentScope("diagram");
+                setActiveCommentThreadId(null);
+                setCommentComposerError(null);
+              }
             }}
             onConnect={onConnect}
             defaultViewport={DEFAULT_VIEWPORT}
@@ -1598,17 +2197,90 @@ function Workspace() {
           </div>
         </section>
 
-        <aside className={`inspector ${inspectorOpen ? "" : "collapsed"}`} aria-label="Selection inspector">
+        <aside className={`inspector${inspectorMode === "comments" ? " comments-mode" : ""} ${inspectorOpen ? "" : "collapsed"}`} aria-label={inspectorMode === "comments" ? "Comments" : "Selection inspector"}>
           <div className="panel-header">
-            <Focus size={14} />
-            <span className="panel-title">Inspector</span>
-            <span className="panel-meta">{selectedRelation ? "relation" : selectedTable ? "table" : "canvas"}</span>
-            <button className="icon-btn compact" onClick={() => setInspectorOpen(false)} aria-label="Close inspector" title="Close inspector">
+            {inspectorMode === "comments" ? <MessageSquare size={14} aria-hidden="true" /> : <Focus size={14} aria-hidden="true" />}
+            <span className="panel-title" ref={commentsHeadingRef} tabIndex={inspectorMode === "comments" ? -1 : undefined}>{inspectorMode === "comments" ? "Comments" : "Inspector"}</span>
+            <span className="panel-meta">{inspectorMode === "comments" ? `${openCommentThreads.length} open` : selectedRelation ? "relation" : selectedTable ? "table" : "canvas"}</span>
+            <button className="icon-btn compact" onClick={() => setInspectorOpen(false)} aria-label={inspectorMode === "comments" ? "Close comments" : "Close inspector"} title={inspectorMode === "comments" ? "Close comments" : "Close inspector"}>
               <PanelRightClose size={14} />
             </button>
           </div>
 
-          {selectedTable ? (
+          <div className="inspector-mode-tabs" role="tablist" aria-label="Right panel view">
+            <button
+              className={inspectorMode === "details" ? "active" : ""}
+              type="button"
+              role="tab"
+              aria-selected={inspectorMode === "details"}
+              onClick={() => {
+                setInspectorMode("details");
+                setInspectorOpen(true);
+              }}
+            >
+              Details
+            </button>
+            <button
+              className={inspectorMode === "comments" ? "active" : ""}
+              type="button"
+              role="tab"
+              aria-selected={inspectorMode === "comments"}
+              onClick={() => openComments(selectedTable ? "table" : "all", selectedTable?.id)}
+            >
+              Comments
+              {openCommentThreads.length > 0 && <span>{openCommentThreads.length > 99 ? "99+" : openCommentThreads.length}</span>}
+            </button>
+          </div>
+
+          {inspectorMode === "comments" ? (
+            <CommentsPanel
+              threads={commentThreads}
+              tables={documentModel.tables}
+              selectedTable={selectedTable}
+              scope={effectiveCommentScope}
+              filter={commentFilter}
+              activeThreadId={activeCommentThreadId}
+              rootDraft={rootCommentDraft}
+              replyDraft={replyCommentDraft}
+              loading={commentsLoading}
+              loaded={commentsLoaded}
+              error={commentsError}
+              composerError={commentComposerError}
+              pendingAction={commentPendingAction}
+              onScopeChange={(scope) => {
+                setCommentScope(scope);
+                setActiveCommentThreadId(null);
+                setCommentComposerError(null);
+              }}
+              onFilterChange={(filter) => {
+                setCommentFilter(filter);
+                setActiveCommentThreadId(null);
+                setCommentComposerError(null);
+              }}
+              onOpenThread={(threadId) => {
+                setActiveCommentThreadId(threadId);
+                setReplyCommentDraft("");
+                setCommentComposerError(null);
+              }}
+              onBack={() => {
+                setActiveCommentThreadId(null);
+                setReplyCommentDraft("");
+                setCommentComposerError(null);
+              }}
+              onRootDraftChange={(value) => {
+                setRootCommentDraft(value);
+                setCommentComposerError(null);
+              }}
+              onReplyDraftChange={(value) => {
+                setReplyCommentDraft(value);
+                setCommentComposerError(null);
+              }}
+              onSubmitRoot={() => void submitRootComment()}
+              onSubmitReply={(threadId) => void submitReplyComment(threadId)}
+              onToggleStatus={(thread) => void toggleCommentStatus(thread)}
+              onRetry={() => void loadComments()}
+            />
+          ) : selectedTable ? (
             <div className="inspector-body">
               <div className="inspector-eyebrow">Table</div>
               <div className="inspector-name">
@@ -1657,6 +2329,14 @@ function Workspace() {
                 <p className="inspector-copy">
                   {documentModel.groups.find((group) => group.tableIds.includes(selectedTable.id))?.name ?? "Ungrouped"}
                 </p>
+              </section>
+              <section className="inspector-section">
+                <div className="section-label">Review</div>
+                <button className="relation-item" type="button" onClick={() => openComments("table", selectedTable.id)}>
+                  <MessageSquare className="relation-icon" size={12} aria-hidden="true" />
+                  <span className="relation-main">Comments on {selectedTable.name}</span>
+                  <span className="relation-kind">{tableOpenCommentCounts.get(selectedTable.id) ?? 0} open</span>
+                </button>
               </section>
             </div>
           ) : selectedRelation ? (
@@ -1833,7 +2513,7 @@ function Workspace() {
                 />
                 <select className="form-select" value={inviteRole} onChange={(event) => setInviteRole(event.target.value)} aria-label="Invite role">
                   <option value="editor">Can edit</option>
-                  <option value="viewer">Can view</option>
+                  <option value="viewer">Can view &amp; comment</option>
                   <option value="owner">Owner</option>
                 </select>
                 <button className="primary-btn" onClick={() => void inviteMember()}><UserPlus size={13} />Invite</button>
@@ -1894,6 +2574,11 @@ function Workspace() {
                   {commandActionMatches.add && (
                     <button className="command-item" onClick={() => { setModal(null); addTable(); }}>
                       <Plus className="command-icon" size={13} /><span>Add a new table</span><span className="command-hint">T</span>
+                    </button>
+                  )}
+                  {commandActionMatches.comments && (
+                    <button className="command-item" onClick={() => { setModal(null); openComments(selectedTable ? "table" : "all", selectedTable?.id); }}>
+                      <MessageSquare className="command-icon" size={13} /><span>Open comments</span><span className="command-hint">C</span>
                     </button>
                   )}
                   {commandActionMatches.layout && (

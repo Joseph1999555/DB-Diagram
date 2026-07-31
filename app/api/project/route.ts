@@ -1,5 +1,4 @@
 import { and, asc, eq, sql } from "drizzle-orm";
-import { getChatGPTUser } from "../../chatgpt-auth";
 import { ensureProjectStorage, getDb } from "../../../db";
 import {
   projectMembers,
@@ -8,10 +7,23 @@ import {
   users,
   type ProjectRole,
 } from "../../../db/schema";
+import {
+  DEFAULT_PROJECT_ID,
+  RouteError,
+  displayNameFromEmail,
+  getRequestIdentity,
+  isEmail,
+  normalizeEmail,
+  readJsonBody,
+  requireRole,
+  routeErrorResponse,
+  upsertUser,
+  type ProjectRow,
+  type UserRow,
+} from "../../../lib/server/project-access";
 
 export const dynamic = "force-dynamic";
 
-const DEMO_PROJECT_ID = "demo";
 const MAX_DBML_LENGTH = 1_000_000;
 const MAX_LAYOUT_LENGTH = 250_000;
 
@@ -110,24 +122,6 @@ const DEFAULT_LAYOUT = {
   order_items: { x: 1048, y: 348 },
   payments: { x: 760, y: 640 },
 };
-
-type RequestIdentity = {
-  email: string;
-  displayName: string;
-};
-
-type UserRow = typeof users.$inferSelect;
-type ProjectRow = typeof projects.$inferSelect;
-
-class RouteError extends Error {
-  constructor(
-    readonly status: number,
-    message: string,
-    readonly code?: string,
-  ) {
-    super(message);
-  }
-}
 
 export async function GET(request: Request) {
   try {
@@ -315,65 +309,13 @@ async function requireProjectAccess(request: Request) {
   return { project, user, role: membership.role };
 }
 
-async function getRequestIdentity(
-  request: Request,
-): Promise<RequestIdentity | null> {
-  const chatGPTUser = await getChatGPTUser();
-  if (chatGPTUser) {
-    return {
-      email: normalizeEmail(chatGPTUser.email),
-      displayName: chatGPTUser.displayName.trim() || chatGPTUser.email,
-    };
-  }
-
-  // Development-only impersonation makes role flows testable without
-  // weakening authentication after deployment.
-  if (process.env.NODE_ENV !== "production") {
-    const email = normalizeEmail(
-      request.headers.get("x-dev-user-email") || "owner@local.dev",
-    );
-    const displayName =
-      request.headers.get("x-dev-user-name")?.trim() ||
-      displayNameFromEmail(email);
-    return { email, displayName };
-  }
-
-  return null;
-}
-
-async function upsertUser(identity: RequestIdentity): Promise<UserRow> {
-  const db = getDb();
-  const email = normalizeEmail(identity.email);
-  const now = new Date().toISOString();
-  const [user] = await db
-    .insert(users)
-    .values({
-      id: crypto.randomUUID(),
-      email,
-      displayName: identity.displayName.trim() || displayNameFromEmail(email),
-      createdAt: now,
-      updatedAt: now,
-    })
-    .onConflictDoUpdate({
-      target: users.email,
-      set: {
-        displayName:
-          identity.displayName.trim() || displayNameFromEmail(email),
-        updatedAt: now,
-      },
-    })
-    .returning();
-
-  return user;
-}
-
 async function ensureDemoProject(currentUser: UserRow): Promise<ProjectRow> {
   const db = getDb();
   const now = new Date().toISOString();
   await db
     .insert(projects)
     .values({
-      id: DEMO_PROJECT_ID,
+      id: DEFAULT_PROJECT_ID,
       name: "Northstar Commerce",
       dbml: DEFAULT_DBML,
       layout: JSON.stringify(DEFAULT_LAYOUT),
@@ -388,7 +330,7 @@ async function ensureDemoProject(currentUser: UserRow): Promise<ProjectRow> {
   const [project] = await db
     .select()
     .from(projects)
-    .where(eq(projects.id, DEMO_PROJECT_ID))
+    .where(eq(projects.id, DEFAULT_PROJECT_ID))
     .limit(1);
 
   if (!project) {
@@ -456,58 +398,4 @@ function parseLayout(value: string): Record<string, unknown> {
   } catch {
     return {};
   }
-}
-
-function requireRole(actual: ProjectRole, allowed: ProjectRole[]) {
-  if (!allowed.includes(actual)) {
-    throw new RouteError(
-      403,
-      "Your project role does not allow this action",
-      "insufficient_role",
-    );
-  }
-}
-
-async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
-  try {
-    const payload = await request.json();
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-      throw new Error("not an object");
-    }
-    return payload as Record<string, unknown>;
-  } catch {
-    throw new RouteError(400, "Request body must be a JSON object", "invalid_json");
-  }
-}
-
-function normalizeEmail(email: string) {
-  return email.trim().toLowerCase();
-}
-
-function displayNameFromEmail(email: string) {
-  const localPart = normalizeEmail(email).split("@")[0] || "Collaborator";
-  return localPart
-    .split(/[._-]+/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
-function isEmail(value: string) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
-}
-
-function routeErrorResponse(error: unknown) {
-  if (error instanceof RouteError) {
-    return Response.json(
-      { error: error.message, code: error.code },
-      { status: error.status },
-    );
-  }
-
-  console.error("Project API error", error);
-  return Response.json(
-    { error: "The project service is temporarily unavailable" },
-    { status: 500 },
-  );
 }

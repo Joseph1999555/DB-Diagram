@@ -70,6 +70,38 @@ export function ensureProjectStorage() {
       d1.prepare(
         `CREATE INDEX IF NOT EXISTS "project_members_user_idx" ON "project_members" ("user_id")`,
       ),
+      d1.prepare(`CREATE TABLE IF NOT EXISTS "comments" (
+        "id" text PRIMARY KEY NOT NULL,
+        "project_id" text NOT NULL,
+        "parent_id" text,
+        "target_type" text NOT NULL,
+        "target_id" text,
+        "target_label" text NOT NULL,
+        "body" text NOT NULL,
+        "status" text DEFAULT 'open' NOT NULL,
+        "author_id" text NOT NULL,
+        "resolved_by_id" text,
+        "resolved_at" text,
+        "created_at" text DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) NOT NULL,
+        "updated_at" text DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) NOT NULL,
+        FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON UPDATE no action ON DELETE cascade,
+        FOREIGN KEY ("parent_id") REFERENCES "comments"("id") ON UPDATE no action ON DELETE cascade,
+        FOREIGN KEY ("author_id") REFERENCES "users"("id") ON UPDATE no action ON DELETE restrict,
+        FOREIGN KEY ("resolved_by_id") REFERENCES "users"("id") ON UPDATE no action ON DELETE set null,
+        CONSTRAINT "comments_target_type_check" CHECK("target_type" in ('diagram', 'table')),
+        CONSTRAINT "comments_target_id_check" CHECK((("target_type" = 'diagram' and "target_id" is null) or ("target_type" = 'table' and "target_id" is not null))),
+        CONSTRAINT "comments_status_check" CHECK("status" in ('open', 'resolved')),
+        CONSTRAINT "comments_body_length_check" CHECK(length(trim("body")) between 1 and 2000)
+      )`),
+      d1.prepare(
+        `CREATE INDEX IF NOT EXISTS "comments_project_created_idx" ON "comments" ("project_id", "created_at", "id")`,
+      ),
+      d1.prepare(
+        `CREATE INDEX IF NOT EXISTS "comments_project_target_created_idx" ON "comments" ("project_id", "target_type", "target_id", "created_at", "id")`,
+      ),
+      d1.prepare(
+        `CREATE INDEX IF NOT EXISTS "comments_parent_idx" ON "comments" ("parent_id")`,
+      ),
     ])
     .then(() => undefined)
     .catch((error: unknown) => {
