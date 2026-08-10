@@ -80,10 +80,16 @@ import {
 } from "@/lib/comments";
 import {
   parseDBML,
+  serializeDBML,
   type DbmlDocument,
   type DbmlGroup,
   type DbmlTable,
 } from "@/lib/dbml";
+import type {
+  SchemaImportFormat,
+  SchemaImportResult,
+  SchemaMergeStrategy,
+} from "@/lib/schema-import";
 import type { SchemaExportFormat } from "@/lib/schema-export";
 import {
   GROUP_FRAME_PADDING,
@@ -212,6 +218,23 @@ const PRESENCE_POLL_MS = 500;
 const PRESENCE_RETRY_MAX_MS = 5000;
 const PRESENCE_SEND_THROTTLE_MS = 350;
 const PRESENCE_HEARTBEAT_MS = 4000;
+const SCHEMA_IMPORT_MAX_BYTES = 2 * 1024 * 1024;
+const SCHEMA_IMPORT_ACCEPT = ".dbml,.sql,.prisma,.ts,.json,.txt,text/plain,application/json,application/sql";
+
+const SCHEMA_IMPORT_FORMATS: ReadonlyArray<{
+  value: SchemaImportFormat;
+  label: string;
+}> = [
+  { value: "auto", label: "Auto detect" },
+  { value: "dbml", label: "DBML" },
+  { value: "postgresql", label: "PostgreSQL" },
+  { value: "mysql", label: "MySQL" },
+  { value: "sqlite", label: "SQLite" },
+  { value: "prisma", label: "Prisma" },
+  { value: "drizzle", label: "Drizzle" },
+  { value: "json-schema", label: "JSON Schema" },
+  { value: "relix", label: "Relix JSON" },
+];
 
 type PresenceCursor = {
   sessionId: string;
@@ -266,6 +289,8 @@ type CanvasMode = "select" | "pan";
 type SaveStatus = "saved" | "syncing" | "offline";
 type CommentScope = "all" | "diagram" | "table";
 type InspectorMode = "details" | "comments";
+type SchemaImportStage = "source" | "preview";
+type SchemaImportChoice = SchemaImportFormat;
 
 function defaultPosition(name: string, index: number) {
   const known: Record<string, { x: number; y: number }> = {
@@ -945,6 +970,26 @@ function decodeLayout(value: unknown): LayoutMap {
   }
 }
 
+function qualifiedTableName(table: DbmlTable) {
+  return table.schema ? `${table.schema}.${table.name}` : table.name;
+}
+
+function validImportedLayout(document: DbmlDocument, value: unknown): LayoutMap | null {
+  const layout = decodeLayout(value);
+  if (document.tables.length === 0 || Object.keys(layout).length === 0) return null;
+
+  const complete = document.tables.every((table) => {
+    const position = layout[table.id] ?? layout[qualifiedTableName(table)] ?? layout[table.name];
+    return Boolean(position && Number.isFinite(position.x) && Number.isFinite(position.y));
+  });
+
+  return complete ? layout : null;
+}
+
+function sourceByteLength(value: string) {
+  return new TextEncoder().encode(value).byteLength;
+}
+
 function diagramStats(document: DbmlDocument) {
   return {
     tables: document.tables.length,
@@ -962,6 +1007,8 @@ function Workspace() {
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const lineNumbersRef = useRef<HTMLPreElement>(null);
   const commentsHeadingRef = useRef<HTMLSpanElement>(null);
+  const importSourceRef = useRef<HTMLTextAreaElement>(null);
+  const importPreviewHeadingRef = useRef<HTMLHeadingElement>(null);
   const historySkipRef = useRef(false);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flow = useReactFlow<DiagramNode>();
@@ -981,6 +1028,19 @@ function Workspace() {
   const [editorTab, setEditorTab] = useState<EditorTab>("dbml");
   const [canvasMode, setCanvasMode] = useState<CanvasMode>("select");
   const [modal, setModal] = useState<ModalName>(null);
+  const [schemaImportStage, setSchemaImportStage] = useState<SchemaImportStage>("source");
+  const [schemaImportFormat, setSchemaImportFormat] = useState<SchemaImportChoice>("auto");
+  const [schemaImportSource, setSchemaImportSource] = useState("");
+  const [schemaImportSourceBytes, setSchemaImportSourceBytes] = useState(0);
+  const [schemaImportFileName, setSchemaImportFileName] = useState<string | undefined>();
+  const [schemaImportResult, setSchemaImportResult] = useState<SchemaImportResult | null>(null);
+  const [schemaImportSelectedTableIds, setSchemaImportSelectedTableIds] = useState<Set<string>>(new Set());
+  const [schemaImportMode, setSchemaImportMode] = useState<"replace" | "merge">("replace");
+  const [schemaImportMergeStrategy, setSchemaImportMergeStrategy] = useState<SchemaMergeStrategy>("update");
+  const [schemaImportError, setSchemaImportError] = useState<string | null>(null);
+  const [schemaImportParsing, setSchemaImportParsing] = useState(false);
+  const [schemaImportGenerating, setSchemaImportGenerating] = useState(false);
+  const [schemaImportDragActive, setSchemaImportDragActive] = useState(false);
   const [commandQuery, setCommandQuery] = useState("");
   const [outlineQuery, setOutlineQuery] = useState("");
   const [parseError, setParseError] = useState<string | null>(null);
@@ -1020,9 +1080,11 @@ function Workspace() {
   const [canvasBounds, setCanvasBounds] = useState<CanvasBounds | null>(null);
   const [historyEntries, setHistoryEntries] = useState<string[]>([DEFAULT_DBML]);
   const [historyIndex, setHistoryIndex] = useState(0);
+  const historyIndexRef = useRef(historyIndex);
   const nodesRef = useRef(nodes);
   const documentModelRef = useRef(documentModel);
   const layoutRequestRef = useRef(0);
+  const schemaImportRequestRef = useRef(0);
   const commentsRequestRef = useRef(0);
   const presenceRequestRef = useRef(0);
   const presenceLastPointRef = useRef<PresencePoint | null>(null);
@@ -1032,6 +1094,28 @@ function Workspace() {
   const presencePutControllersRef = useRef(new Set<AbortController>());
 
   const stats = useMemo(() => diagramStats(documentModel), [documentModel]);
+  const schemaImportStats = useMemo(
+    () => schemaImportResult ? diagramStats(schemaImportResult.document) : null,
+    [schemaImportResult],
+  );
+  const schemaImportWarnings = useMemo(
+    () => schemaImportResult?.diagnostics.filter((diagnostic) => diagnostic.level === "warning") ?? [],
+    [schemaImportResult],
+  );
+  const schemaImportAllSelected = Boolean(
+    schemaImportResult?.document.tables.length &&
+    schemaImportSelectedTableIds.size === schemaImportResult.document.tables.length,
+  );
+  const schemaImportConflictCount = useMemo(() => {
+    if (!schemaImportResult) return 0;
+    const existingNames = new Set(
+      documentModel.tables.map((table) => qualifiedTableName(table).toLocaleLowerCase("en-US")),
+    );
+    return schemaImportResult.document.tables.filter(
+      (table) => schemaImportSelectedTableIds.has(table.id) &&
+        existingNames.has(qualifiedTableName(table).toLocaleLowerCase("en-US")),
+    ).length;
+  }, [documentModel.tables, schemaImportResult, schemaImportSelectedTableIds]);
   const editorLineNumbers = useMemo(
     () => Array.from({ length: Math.max(1, dbml.split("\n").length) }, (_, index) => index + 1).join("\n"),
     [dbml],
@@ -1049,6 +1133,50 @@ function Workspace() {
     setToast(message);
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     toastTimerRef.current = setTimeout(() => setToast(null), 2800);
+  }, []);
+
+  const resetSchemaImport = useCallback(() => {
+    schemaImportRequestRef.current += 1;
+    layoutRequestRef.current += 1;
+    setSchemaImportStage("source");
+    setSchemaImportFormat("auto");
+    setSchemaImportSource("");
+    setSchemaImportSourceBytes(0);
+    setSchemaImportFileName(undefined);
+    setSchemaImportResult(null);
+    setSchemaImportSelectedTableIds(new Set());
+    setSchemaImportMode("replace");
+    setSchemaImportMergeStrategy("update");
+    setSchemaImportError(null);
+    setSchemaImportParsing(false);
+    setSchemaImportGenerating(false);
+    setSchemaImportDragActive(false);
+    setIsSmartLayouting(false);
+  }, []);
+
+  const openSchemaImport = useCallback(() => {
+    resetSchemaImport();
+    setModal("import");
+  }, [resetSchemaImport]);
+
+  const closeSchemaImport = useCallback(() => {
+    schemaImportRequestRef.current += 1;
+    layoutRequestRef.current += 1;
+    setSchemaImportParsing(false);
+    setSchemaImportGenerating(false);
+    setSchemaImportDragActive(false);
+    setIsSmartLayouting(false);
+    setModal(null);
+  }, []);
+
+  const backToSchemaImportSource = useCallback(() => {
+    schemaImportRequestRef.current += 1;
+    setSchemaImportResult(null);
+    setSchemaImportSelectedTableIds(new Set());
+    setSchemaImportError(null);
+    setSchemaImportParsing(false);
+    setSchemaImportGenerating(false);
+    setSchemaImportStage("source");
   }, []);
 
   const sendPresencePoint = useCallback((point: PresencePoint) => {
@@ -1271,10 +1399,23 @@ function Workspace() {
   }, [documentModel]);
 
   useEffect(() => {
+    historyIndexRef.current = historyIndex;
+  }, [historyIndex]);
+
+  useEffect(() => {
     return () => {
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    if (modal !== "import") return;
+    const frame = window.requestAnimationFrame(() => {
+      if (schemaImportStage === "source") importSourceRef.current?.focus();
+      else importPreviewHeadingRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [modal, schemaImportStage]);
 
   useEffect(() => {
     const preloadExports = () => {
@@ -1368,6 +1509,7 @@ function Workspace() {
       setHistoryEntries((previous) => {
         if (previous[historyIndex] === dbml) return previous;
         const next = [...previous.slice(0, historyIndex + 1), dbml].slice(-30);
+        historyIndexRef.current = next.length - 1;
         setHistoryIndex(next.length - 1);
         return next;
       });
@@ -1764,6 +1906,7 @@ function Workspace() {
     if (historyIndex <= 0) return;
     const nextIndex = historyIndex - 1;
     historySkipRef.current = true;
+    historyIndexRef.current = nextIndex;
     setHistoryIndex(nextIndex);
     setDbml(historyEntries[nextIndex]);
   }, [historyEntries, historyIndex]);
@@ -1772,6 +1915,7 @@ function Workspace() {
     if (historyIndex >= historyEntries.length - 1) return;
     const nextIndex = historyIndex + 1;
     historySkipRef.current = true;
+    historyIndexRef.current = nextIndex;
     setHistoryIndex(nextIndex);
     setDbml(historyEntries[nextIndex]);
   }, [historyEntries, historyIndex]);
@@ -1794,9 +1938,21 @@ function Workspace() {
         showToast("Workspace saved");
         return;
       }
+      if (modifier && !isTyping && !modal && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        if (event.shiftKey) redo();
+        else undo();
+        return;
+      }
+      if (modifier && !isTyping && !modal && event.key.toLowerCase() === "y") {
+        event.preventDefault();
+        redo();
+        return;
+      }
       if (event.key === "Escape") {
         if (modal) {
-          setModal(null);
+          if (modal === "import") closeSchemaImport();
+          else setModal(null);
           return;
         }
         if (inspectorOpen && inspectorMode === "comments") {
@@ -1843,7 +1999,7 @@ function Workspace() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeCommentThreadId, applySmartLayout, fitDiagram, flow, inspectorMode, inspectorOpen, modal, openComments, saveProject, selectedTableId, showToast]);
+  }, [activeCommentThreadId, applySmartLayout, closeSchemaImport, fitDiagram, flow, inspectorMode, inspectorOpen, modal, openComments, redo, saveProject, selectedTableId, showToast, undo]);
 
   const exportDbml = useCallback(() => {
     downloadBlob(dbml, "text/plain;charset=utf-8", `${safeFileName(projectName)}.dbml`);
@@ -1932,88 +2088,219 @@ function Workspace() {
     }
   }, [flow, projectName, showToast]);
 
-  const importText = useCallback(
-    async (contents: string, layout?: LayoutMap) => {
-      const parsed = parseDBML(contents);
-      const error = parsed.diagnostics.find((diagnostic) => diagnostic.level === "error");
-      if (error || parsed.tables.length === 0) {
-        showToast(error?.message ?? "No DBML tables found in this file");
+  const updateSchemaImportSource = useCallback((nextSource: string) => {
+    const nextBytes = sourceByteLength(nextSource);
+    if (nextBytes > SCHEMA_IMPORT_MAX_BYTES) {
+      setSchemaImportError("Schema source is larger than 2 MB. Split it into smaller imports and try again.");
+      return;
+    }
+    setSchemaImportSource(nextSource);
+    setSchemaImportSourceBytes(nextBytes);
+    setSchemaImportFileName(undefined);
+    setSchemaImportResult(null);
+    setSchemaImportError(null);
+  }, []);
+
+  const readSchemaImportFile = useCallback(async (file: File) => {
+    const requestId = schemaImportRequestRef.current + 1;
+    schemaImportRequestRef.current = requestId;
+    setSchemaImportError(null);
+    setSchemaImportParsing(true);
+
+    try {
+      if (file.size > SCHEMA_IMPORT_MAX_BYTES) {
+        throw new Error("This file is larger than 2 MB. Split it into smaller schema files and try again.");
+      }
+      if (!/\.(dbml|sql|prisma|ts|json|txt)$/i.test(file.name)) {
+        throw new Error("Choose a DBML, SQL, Prisma, TypeScript, JSON, or text schema file.");
+      }
+
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+      const contents = await file.text();
+      const contentBytes = sourceByteLength(contents);
+      if (contentBytes > SCHEMA_IMPORT_MAX_BYTES) {
+        throw new Error("This file is larger than 2 MB. Split it into smaller schema files and try again.");
+      }
+      if (schemaImportRequestRef.current !== requestId) return;
+
+      setSchemaImportSource(contents);
+      setSchemaImportSourceBytes(contentBytes);
+      setSchemaImportFileName(file.name);
+      setSchemaImportFormat("auto");
+      setSchemaImportResult(null);
+      setSchemaImportError(null);
+    } catch (error) {
+      if (schemaImportRequestRef.current === requestId) {
+        setSchemaImportError(error instanceof Error ? error.message : "The schema file could not be read.");
+      }
+    } finally {
+      if (schemaImportRequestRef.current === requestId) setSchemaImportParsing(false);
+    }
+  }, []);
+
+  const parseSchemaImportSource = useCallback(async () => {
+    if (!schemaImportSource.trim()) {
+      setSchemaImportError("Paste a schema or choose a schema file before parsing.");
+      importSourceRef.current?.focus();
+      return;
+    }
+    if (schemaImportSourceBytes > SCHEMA_IMPORT_MAX_BYTES) {
+      setSchemaImportError("Schema source is larger than 2 MB. Split it into smaller imports and try again.");
+      return;
+    }
+
+    const requestId = schemaImportRequestRef.current + 1;
+    schemaImportRequestRef.current = requestId;
+    setSchemaImportError(null);
+    setSchemaImportResult(null);
+    setSchemaImportParsing(true);
+
+    try {
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+      const { parseSchemaImport } = await import("@/lib/schema-import");
+      const result = await Promise.resolve(parseSchemaImport(schemaImportSource, {
+        format: schemaImportFormat,
+        fileName: schemaImportFileName,
+      }));
+      if (schemaImportRequestRef.current !== requestId) return;
+
+      const error = result.diagnostics.find((diagnostic) => diagnostic.level === "error");
+      if (error || result.document.tables.length === 0) {
+        throw new Error(error?.message ?? "No tables were found in this schema.");
+      }
+
+      setSchemaImportResult(result);
+      setSchemaImportSelectedTableIds(new Set(result.document.tables.map((table) => table.id)));
+      setSchemaImportMode("replace");
+      setSchemaImportMergeStrategy("update");
+      setSchemaImportStage("preview");
+    } catch (error) {
+      if (schemaImportRequestRef.current === requestId) {
+        setSchemaImportError(error instanceof Error ? error.message : "This schema could not be parsed.");
+      }
+    } finally {
+      if (schemaImportRequestRef.current === requestId) setSchemaImportParsing(false);
+    }
+  }, [schemaImportFileName, schemaImportFormat, schemaImportSource, schemaImportSourceBytes]);
+
+  const toggleSchemaImportTable = useCallback((tableId: string) => {
+    setSchemaImportSelectedTableIds((current) => {
+      const next = new Set(current);
+      if (next.has(tableId)) next.delete(tableId);
+      else next.add(tableId);
+      return next;
+    });
+    setSchemaImportError(null);
+  }, []);
+
+  const toggleAllSchemaImportTables = useCallback(() => {
+    if (!schemaImportResult) return;
+    setSchemaImportSelectedTableIds(schemaImportAllSelected
+      ? new Set()
+      : new Set(schemaImportResult.document.tables.map((table) => table.id)));
+    setSchemaImportError(null);
+  }, [schemaImportAllSelected, schemaImportResult]);
+
+  const generateSchemaImport = useCallback(async () => {
+    if (!schemaImportResult || schemaImportSelectedTableIds.size === 0) {
+      setSchemaImportError("Select at least one table to generate a diagram.");
+      return;
+    }
+
+    const requestId = schemaImportRequestRef.current + 1;
+    const layoutRequestId = layoutRequestRef.current + 1;
+    const currentDocument = documentModelRef.current;
+    schemaImportRequestRef.current = requestId;
+    layoutRequestRef.current = layoutRequestId;
+    setSchemaImportError(null);
+    setSchemaImportGenerating(true);
+
+    try {
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+      const { filterSchemaDocument, mergeSchemaDocuments } = await import("@/lib/schema-import");
+      const importedDocument = filterSchemaDocument(
+        schemaImportResult.document,
+        schemaImportSelectedTableIds,
+      );
+      const nextDocument = schemaImportMode === "merge"
+        ? mergeSchemaDocuments(currentDocument, importedDocument, schemaImportMergeStrategy).document
+        : importedDocument;
+      const nextDbml = `${serializeDBML(nextDocument, { includeGeneratedHeader: true }).trimEnd()}\n`;
+      const restoredLayout = schemaImportMode === "replace" && schemaImportResult.format === "relix"
+        ? validImportedLayout(importedDocument, schemaImportResult.layout)
+        : null;
+      let nextLayout = restoredLayout;
+      let arranged = false;
+
+      if (!nextLayout) {
+        setIsSmartLayouting(true);
+        const { computeAutoLayout } = await import("@/lib/auto-layout");
+        nextLayout = (await computeAutoLayout(nextDocument)).positions;
+        arranged = true;
+      }
+
+      if (
+        schemaImportRequestRef.current !== requestId ||
+        layoutRequestRef.current !== layoutRequestId
+      ) return;
+      if (documentModelRef.current !== currentDocument) {
+        setSchemaImportError("The project changed while this import was being arranged. Review it and generate again.");
         return;
       }
 
-      const importRequestId = layoutRequestRef.current + 1;
-      layoutRequestRef.current = importRequestId;
-      let resolvedLayout = layout;
-      let arranged = false;
-      if (!resolvedLayout || Object.keys(resolvedLayout).length === 0) {
-        setIsSmartLayouting(true);
-        showToast("Arranging imported schema…");
-        try {
-          const { computeAutoLayout } = await import("@/lib/auto-layout");
-          resolvedLayout = (await computeAutoLayout(parsed)).positions;
-          arranged = true;
-        } finally {
-          if (layoutRequestRef.current === importRequestId) setIsSmartLayouting(false);
-        }
-      } else {
-        setIsSmartLayouting(false);
-      }
-      if (layoutRequestRef.current !== importRequestId) return;
+      setHistoryEntries((previous) => {
+        const activeIndex = Math.min(historyIndexRef.current, previous.length - 1);
+        if (previous[activeIndex] === nextDbml) return previous;
+        const nextHistory = [...previous.slice(0, activeIndex + 1), nextDbml].slice(-30);
+        historyIndexRef.current = nextHistory.length - 1;
+        setHistoryIndex(nextHistory.length - 1);
+        return nextHistory;
+      });
 
-      setDbml(contents);
-      setDocumentModel(parsed);
-      setNodes(buildNodes(parsed, resolvedLayout));
-      setSelectedTableId(parsed.tables[0]?.id ?? null);
+      documentModelRef.current = nextDocument;
+      setDbml(nextDbml);
+      setDocumentModel(nextDocument);
+      setNodes(buildNodes(nextDocument, nextLayout));
+      setParseError(null);
+      setParseLine(undefined);
+      setSelectedTableId(nextDocument.tables[0]?.id ?? null);
       setSelectedRelationId(null);
       setActiveGroup("all");
-      setModal(null);
-      window.requestAnimationFrame(() => window.requestAnimationFrame(fitDiagram));
-      showToast(`Imported ${parsed.tables.length} tables and ${parsed.relations.length} relations${arranged ? " · smart layout" : ""}`);
-    },
-    [fitDiagram, setNodes, showToast],
-  );
-
-  const importFile = useCallback(
-    async (file: File) => {
-      try {
-        const contents = await file.text();
-        if (file.name.toLowerCase().endsWith(".json")) {
-          const snapshot = JSON.parse(contents) as {
-            dbml?: string;
-            layout?: LayoutMap;
-            project?: { dbml?: string; layout?: LayoutMap; name?: string };
-          };
-          const importedDbml = snapshot.project?.dbml ?? snapshot.dbml;
-          if (!importedDbml) throw new Error("This JSON file does not contain a DBML snapshot");
-          if (snapshot.project?.name) setProjectName(snapshot.project.name);
-          await importText(importedDbml, snapshot.project?.layout ?? snapshot.layout);
-          return;
-        }
-        await importText(contents);
-      } catch (error) {
-        showToast(error instanceof Error ? error.message : "Import failed");
+      setEditorOpen(true);
+      setEditorTab("dbml");
+      if (schemaImportMode === "replace" && schemaImportResult.format === "relix" && schemaImportResult.projectName) {
+        setProjectName(schemaImportResult.projectName);
       }
-    },
-    [importText, showToast],
-  );
+      setLayoutRevision((revision) => revision + 1);
+      setModal(null);
+      setSchemaImportGenerating(false);
+      setIsSmartLayouting(false);
+      window.requestAnimationFrame(() => window.requestAnimationFrame(fitDiagram));
+      showToast(
+        `Generated ${nextDocument.tables.length} tables and ${nextDocument.relations.length} relations${arranged ? " · smart layout" : " · restored layout"}. Press Ctrl+Z to undo.`,
+      );
+    } catch (error) {
+      if (schemaImportRequestRef.current === requestId) {
+        setSchemaImportError(error instanceof Error ? error.message : "The diagram could not be generated.");
+      }
+    } finally {
+      if (schemaImportRequestRef.current === requestId) setSchemaImportGenerating(false);
+      if (layoutRequestRef.current === layoutRequestId) setIsSmartLayouting(false);
+    }
+  }, [fitDiagram, schemaImportMergeStrategy, schemaImportMode, schemaImportResult, schemaImportSelectedTableIds, setNodes, showToast]);
 
-  const onImportInput = useCallback(
-    (event: ChangeEvent<HTMLInputElement>) => {
-      const file = event.target.files?.[0];
-      if (file) void importFile(file);
-      event.target.value = "";
-    },
-    [importFile],
-  );
+  const onImportInput = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) void readSchemaImportFile(file);
+    event.target.value = "";
+  }, [readSchemaImportFile]);
 
-  const onDropFile = useCallback(
-    (event: DragEvent<HTMLLabelElement>) => {
-      event.preventDefault();
-      const file = event.dataTransfer.files?.[0];
-      if (file) void importFile(file);
-    },
-    [importFile],
-  );
+  const onDropFile = useCallback((event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setSchemaImportDragActive(false);
+    const file = event.dataTransfer.files?.[0];
+    if (file) void readSchemaImportFile(file);
+  }, [readSchemaImportFile]);
 
   const inviteMember = useCallback(async () => {
     const email = inviteEmail.trim().toLowerCase();
@@ -2170,7 +2457,7 @@ function Workspace() {
             <span className="action-label">Comments</span>
             {openCommentThreads.length > 0 && <span className="comment-count-badge">{openCommentThreads.length > 99 ? "99+" : openCommentThreads.length}</span>}
           </button>
-          <button className="text-btn hide-mobile" onClick={() => setModal("import")}>
+          <button className="text-btn import-trigger mobile-essential" onClick={openSchemaImport} aria-label="Import schema" title="Import schema">
             <Import size={13} />
             <span className="action-label">Import</span>
           </button>
@@ -2700,27 +2987,301 @@ function Workspace() {
       </section>
 
       {modal === "import" && (
-        <div className="modal-backdrop" onMouseDown={() => setModal(null)}>
-          <div className="modal small" role="dialog" aria-modal="true" aria-labelledby="import-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-backdrop" onMouseDown={closeSchemaImport}>
+          <div
+            className="modal import-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="import-title"
+            aria-describedby="import-description"
+            aria-busy={schemaImportParsing || schemaImportGenerating}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
             <div className="modal-head">
               <div>
                 <div className="modal-title" id="import-title">Import schema</div>
-                <div className="modal-subtitle">Replace the current workspace with DBML or restore a complete Relix snapshot.</div>
-              </div>
-              <button className="icon-btn compact modal-close" onClick={() => setModal(null)} aria-label="Close import dialog"><X size={14} /></button>
-            </div>
-            <div className="modal-body">
-              <label className="drop-zone" onDragOver={(event) => event.preventDefault()} onDrop={onDropFile}>
-                <input type="file" accept=".dbml,.txt,.json,text/plain,application/json" onChange={onImportInput} />
-                <div>
-                  <Upload size={22} style={{ margin: "0 auto", color: "var(--accent)" }} />
-                  <strong>Drop a DBML or Relix JSON file</strong>
-                  <span>or click to choose a file · current schema will be replaced</span>
+                <div className="modal-subtitle" id="import-description">
+                  Paste or upload a schema, review what Relix found, then replace or merge without changing the diagram early.
                 </div>
-              </label>
+              </div>
+              <div className="import-stepper" aria-label="Import progress">
+                <span className={schemaImportStage === "source" ? "active" : "complete"}>
+                  <b>1</b><i>Source</i>
+                </span>
+                <span className={schemaImportStage === "preview" ? "active" : ""}>
+                  <b>2</b><i>Preview</i>
+                </span>
+              </div>
+              <button className="icon-btn compact modal-close" type="button" onClick={closeSchemaImport} aria-label="Close import dialog"><X size={14} /></button>
+            </div>
+            <div className="modal-body import-modal-body">
+              {schemaImportStage === "source" ? (
+                <div className="import-source-stage">
+                  <div className="import-source-grid">
+                    <section className="import-source-editor" aria-labelledby="import-source-heading">
+                      <div className="import-section-head">
+                        <div>
+                          <h2 id="import-source-heading">Schema source</h2>
+                          <p id="import-source-help">Paste text from DBML, SQL DDL, Prisma, Drizzle, JSON Schema, or a Relix snapshot.</p>
+                        </div>
+                        <label className="import-format-field" htmlFor="schema-import-format">
+                          <span>Format</span>
+                          <select
+                            id="schema-import-format"
+                            className="form-select"
+                            value={schemaImportFormat}
+                            onChange={(event) => {
+                              setSchemaImportFormat(event.target.value as SchemaImportChoice);
+                              setSchemaImportError(null);
+                            }}
+                            disabled={schemaImportParsing}
+                          >
+                            {SCHEMA_IMPORT_FORMATS.map((format) => (
+                              <option value={format.value} key={format.value}>{format.label}</option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+                      <textarea
+                        ref={importSourceRef}
+                        className="import-source-textarea"
+                        value={schemaImportSource}
+                        onChange={(event) => updateSchemaImportSource(event.target.value)}
+                        aria-label="Schema source"
+                        aria-describedby={`import-source-help${schemaImportError ? " schema-import-error" : ""}`}
+                        placeholder={'CREATE TABLE users (\n  id uuid PRIMARY KEY,\n  email varchar(255) NOT NULL UNIQUE\n);'}
+                        spellCheck={false}
+                        disabled={schemaImportParsing}
+                      />
+                      <div className="import-source-meta">
+                        <span>{schemaImportFileName ? `Loaded ${schemaImportFileName}` : "Paste schema text here"}</span>
+                        <span>{Math.ceil(schemaImportSourceBytes / 1024).toLocaleString()} KB / 2,048 KB</span>
+                      </div>
+                    </section>
+
+                    <aside
+                      className={`import-upload-panel ${schemaImportDragActive ? "drag-active" : ""}`}
+                      onDragEnter={(event) => {
+                        event.preventDefault();
+                        setSchemaImportDragActive(true);
+                      }}
+                      onDragOver={(event) => event.preventDefault()}
+                      onDragLeave={(event) => {
+                        if (!event.currentTarget.contains(event.relatedTarget as HTMLElement | null)) {
+                          setSchemaImportDragActive(false);
+                        }
+                      }}
+                      onDrop={onDropFile}
+                    >
+                      <label className="drop-zone import-drop-zone" htmlFor="schema-import-file">
+                        <input
+                          id="schema-import-file"
+                          type="file"
+                          accept={SCHEMA_IMPORT_ACCEPT}
+                          onChange={onImportInput}
+                          disabled={schemaImportParsing}
+                        />
+                        <div>
+                          {schemaImportParsing ? (
+                            <LoaderCircle className="spin" size={24} aria-hidden="true" />
+                          ) : (
+                            <Upload size={24} aria-hidden="true" />
+                          )}
+                          <strong>{schemaImportParsing ? "Reading schema…" : "Drop a schema file"}</strong>
+                          <span>or click to choose one</span>
+                        </div>
+                      </label>
+                      <div className="import-file-types">
+                        <strong>Accepted files</strong>
+                        <span>.dbml · .sql · .prisma · .ts · .json · .txt</span>
+                        <small>Text schemas only · maximum 2 MB</small>
+                      </div>
+                    </aside>
+                  </div>
+
+                  <div className="import-safety-note">
+                    Relix reads schema definitions only. Imported SQL and TypeScript are never executed.
+                  </div>
+                </div>
+              ) : schemaImportResult && schemaImportStats ? (
+                <div className="import-preview-stage">
+                  <div className="import-preview-heading-row">
+                    <div>
+                      <h2 ref={importPreviewHeadingRef} tabIndex={-1}>Ready to generate</h2>
+                      <p>Detected <strong>{schemaImportResult.label}</strong>. Choose the tables and how they should enter this project.</p>
+                    </div>
+                    <span className="import-format-badge">{schemaImportResult.label}</span>
+                  </div>
+
+                  <div className="import-stat-grid" aria-label="Schema preview summary">
+                    <div><strong>{schemaImportStats.tables}</strong><span>Tables</span></div>
+                    <div><strong>{schemaImportStats.fields}</strong><span>Fields</span></div>
+                    <div><strong>{schemaImportStats.relations}</strong><span>Relations</span></div>
+                    <div className={schemaImportWarnings.length > 0 ? "has-warnings" : ""}>
+                      <strong>{schemaImportWarnings.length}</strong><span>Warnings</span>
+                    </div>
+                  </div>
+
+                  <div className="import-preview-grid">
+                    <section className="import-table-picker" aria-labelledby="import-tables-heading">
+                      <div className="import-table-picker-head">
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={schemaImportAllSelected}
+                            ref={(input) => {
+                              if (input) input.indeterminate = schemaImportSelectedTableIds.size > 0 && !schemaImportAllSelected;
+                            }}
+                            onChange={toggleAllSchemaImportTables}
+                            disabled={schemaImportGenerating}
+                          />
+                          <span id="import-tables-heading">Select all tables</span>
+                        </label>
+                        <span>{schemaImportSelectedTableIds.size} of {schemaImportStats.tables}</span>
+                      </div>
+                      <div className="import-table-list">
+                        {schemaImportResult.document.tables.map((table) => (
+                          <label className="import-table-row" key={table.id}>
+                            <input
+                              type="checkbox"
+                              checked={schemaImportSelectedTableIds.has(table.id)}
+                              onChange={() => toggleSchemaImportTable(table.id)}
+                              disabled={schemaImportGenerating}
+                              aria-label={`Import ${qualifiedTableName(table)}`}
+                            />
+                            <span className="import-table-name">
+                              <strong>{qualifiedTableName(table)}</strong>
+                              <small>{table.fields.length} fields</small>
+                            </span>
+                            <span className="import-table-key-count">
+                              {table.fields.filter((field) => field.primaryKey).length} PK
+                            </span>
+                          </label>
+                        ))}
+                      </div>
+                    </section>
+
+                    <aside className="import-options-panel">
+                      <fieldset className="import-option-group">
+                        <legend>Generate mode</legend>
+                        <label className={schemaImportMode === "replace" ? "active" : ""}>
+                          <input
+                            type="radio"
+                            name="schema-import-mode"
+                            value="replace"
+                            checked={schemaImportMode === "replace"}
+                            onChange={() => setSchemaImportMode("replace")}
+                            disabled={schemaImportGenerating}
+                          />
+                          <span><strong>Replace current</strong><small>Use only the selected imported tables.</small></span>
+                        </label>
+                        <label className={schemaImportMode === "merge" ? "active" : ""}>
+                          <input
+                            type="radio"
+                            name="schema-import-mode"
+                            value="merge"
+                            checked={schemaImportMode === "merge"}
+                            onChange={() => setSchemaImportMode("merge")}
+                            disabled={schemaImportGenerating}
+                          />
+                          <span><strong>Merge with current</strong><small>Add imported tables to this project.</small></span>
+                        </label>
+                      </fieldset>
+
+                      {schemaImportMode === "merge" && schemaImportConflictCount > 0 && (
+                        <fieldset className="import-option-group conflict-options">
+                          <legend>{schemaImportConflictCount} name {schemaImportConflictCount === 1 ? "conflict" : "conflicts"}</legend>
+                          {([
+                            ["update", "Update existing", "Imported definitions replace matching tables."],
+                            ["rename", "Rename imported", "Keep both by creating unique imported names."],
+                            ["skip", "Skip conflicts", "Keep existing definitions unchanged."],
+                          ] as Array<[SchemaMergeStrategy, string, string]>).map(([value, label, help]) => (
+                            <label className={schemaImportMergeStrategy === value ? "active" : ""} key={value}>
+                              <input
+                                type="radio"
+                                name="schema-import-conflicts"
+                                value={value}
+                                checked={schemaImportMergeStrategy === value}
+                                onChange={() => setSchemaImportMergeStrategy(value)}
+                                disabled={schemaImportGenerating}
+                              />
+                              <span><strong>{label}</strong><small>{help}</small></span>
+                            </label>
+                          ))}
+                        </fieldset>
+                      )}
+
+                      <section className="import-warning-panel" aria-labelledby="import-warnings-heading">
+                        <div>
+                          <strong id="import-warnings-heading">Parser warnings</strong>
+                          <span>{schemaImportWarnings.length}</span>
+                        </div>
+                        {schemaImportWarnings.length === 0 ? (
+                          <p>No warnings. The selected schema is ready.</p>
+                        ) : (
+                          <ul>
+                            {schemaImportWarnings.slice(0, 6).map((warning, index) => (
+                              <li key={`${warning.code}-${warning.line ?? "schema"}-${index}`}>
+                                {warning.line ? `Line ${warning.line}: ` : ""}{warning.message}
+                              </li>
+                            ))}
+                            {schemaImportWarnings.length > 6 && (
+                              <li>{schemaImportWarnings.length - 6} more warnings</li>
+                            )}
+                          </ul>
+                        )}
+                      </section>
+                    </aside>
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="import-feedback" aria-live="polite" aria-atomic="true">
+                {schemaImportError && (
+                  <div className="import-error" id="schema-import-error" role="alert">{schemaImportError}</div>
+                )}
+                {!schemaImportError && schemaImportParsing && (
+                  <div className="import-progress" role="status"><LoaderCircle className="spin" size={13} aria-hidden="true" />Reading and validating schema…</div>
+                )}
+                {!schemaImportError && schemaImportGenerating && (
+                  <div className="import-progress" role="status"><LoaderCircle className="spin" size={13} aria-hidden="true" />Generating tables and smart layout…</div>
+                )}
+              </div>
             </div>
             <div className="modal-footer">
-              <button className="text-btn" onClick={() => setModal(null)}>Cancel</button>
+              <button className="text-btn import-reset-btn" type="button" onClick={resetSchemaImport} disabled={schemaImportParsing || schemaImportGenerating}>Reset</button>
+              <div className="import-footer-actions">
+                {schemaImportStage === "preview" && (
+                  <button className="text-btn" type="button" onClick={backToSchemaImportSource} disabled={schemaImportGenerating}>
+                    <ArrowLeft size={13} aria-hidden="true" /><span>Back</span>
+                  </button>
+                )}
+                <button className="text-btn" type="button" onClick={closeSchemaImport}>Cancel</button>
+                {schemaImportStage === "source" ? (
+                  <button
+                    className="primary-btn"
+                    type="button"
+                    onClick={() => void parseSchemaImportSource()}
+                    disabled={schemaImportParsing || !schemaImportSource.trim()}
+                  >
+                    {schemaImportParsing ? (
+                      <><LoaderCircle className="spin" size={13} aria-hidden="true" /><span>Parsing…</span></>
+                    ) : (
+                      <><Search size={13} aria-hidden="true" /><span>Parse schema</span></>
+                    )}
+                  </button>
+                ) : (
+                  <button
+                    className="primary-btn"
+                    type="button"
+                    onClick={() => void generateSchemaImport()}
+                    disabled={schemaImportGenerating || schemaImportSelectedTableIds.size === 0}
+                  >
+                    {schemaImportGenerating ? <LoaderCircle className="spin" size={13} aria-hidden="true" /> : <WandSparkles size={13} aria-hidden="true" />}
+                    {schemaImportGenerating ? "Generating…" : "Generate diagram"}
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>
