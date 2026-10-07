@@ -1,6 +1,7 @@
 import ELK from "elkjs/lib/elk.bundled.js";
-import type { ElkExtendedEdge, ElkNode } from "elkjs/lib/elk-api";
+import type { ELK as ElkEngine, ElkExtendedEdge, ElkNode } from "elkjs/lib/elk-api";
 import type { DbmlDocument, DbmlRelation, DbmlTable } from "@/lib/dbml";
+import { getDiagramGroups, groupBounds } from "@/lib/diagram-groups";
 import {
   GROUP_FRAME_PADDING,
   LAYOUT_GRID_SIZE,
@@ -21,6 +22,8 @@ export const LAYOUT_GAPS = {
 } as const;
 
 const CANVAS_MARGIN = 72;
+
+const snapUp = (value: number) => Math.ceil(value / LAYOUT_GRID_SIZE) * LAYOUT_GRID_SIZE;
 
 export type AutoLayoutMap = Record<string, { x: number; y: number }>;
 
@@ -105,9 +108,12 @@ function buildElkGraph(document: DbmlDocument): ElkNode {
   const ungrouped = document.tables
     .filter((table) => !assignedTableIds.has(table.id))
     .map(tableNode);
+  const seenEdges = new Set<string>();
   const edges: ElkExtendedEdge[] = document.relations.flatMap((relation, index) => {
     const { source, target } = directedEndpoints(relation);
-    if (!tableIds.has(source) || !tableIds.has(target)) return [];
+    const key = `${source}\0${target}`;
+    if (source === target || !tableIds.has(source) || !tableIds.has(target) || seenEdges.has(key)) return [];
+    seenEdges.add(key);
     return [{ id: `layout-edge-${index}-${relation.id}`, sources: [source], targets: [target] }];
   });
 
@@ -129,10 +135,75 @@ function buildElkGraph(document: DbmlDocument): ElkNode {
       "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
       "elk.layered.cycleBreaking.strategy": "GREEDY_MODEL_ORDER",
       "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
+      "elk.layered.highDegreeNodes.treatment": "true",
+      "elk.layered.highDegreeNodes.threshold": "5",
       "elk.randomSeed": "1",
       "elk.separateConnectedComponents": "true",
+      "elk.aspectRatio": "1.6",
     },
   };
+}
+
+async function layoutBalanced(elk: ElkEngine, graph: ElkNode) {
+  const primary = await elk.layout(graph);
+  const count = graph.children?.length ?? 0;
+  const ratio = (primary.width ?? 1) / Math.max(1, primary.height ?? 1);
+  // Most diagrams need only one pass. Bound the extra optimization work for
+  // very large graphs, and retry only a severely stretched dense component.
+  if (count < 12 || count > 500 || (ratio >= 0.75 && ratio <= 2.8)) return primary;
+  const balanced = await elk.layout({
+    ...graph,
+    layoutOptions: {
+      ...graph.layoutOptions,
+      "elk.layered.layering.strategy": "COFFMAN_GRAHAM",
+      "elk.layered.layering.coffmanGraham.layerBound": String(Math.max(4, Math.ceil(Math.sqrt(count / 1.6)))),
+      "elk.layered.highDegreeNodes.treatment": "false",
+    },
+  });
+  const score = (layout: ElkNode) => {
+    const width = layout.width ?? 0, height = layout.height ?? 0;
+    // Fit a landscape canvas, with an area penalty to avoid sparse sprawling.
+    return Math.max(width / 1.6, height) * 0.85 + Math.sqrt(width * height / 1.6) * 0.15;
+  };
+  return score(balanced) < score(primary) ? balanced : primary;
+}
+
+/** Arrange members first, then arrange group envelopes as indivisible nodes.
+ * Cross-schema references influence cluster order without stretching a group
+ * around unrelated tables (a common problem with compound layered layouts). */
+async function layoutClusters(elk: ElkEngine, document: DbmlDocument) {
+  const graph = buildElkGraph(document);
+  const owner = new Map<string, string>();
+  const locals = new Map<string, ElkNode>();
+  const children = await Promise.all((graph.children ?? []).map(async (child) => {
+    if (!child.children) {
+      owner.set(child.id, child.id);
+      return child;
+    }
+    const ids = new Set(child.children.map((member) => member.id));
+    ids.forEach((id) => owner.set(id, child.id));
+    const local = await layoutBalanced(elk, {
+      ...child,
+      edges: graph.edges?.filter((edge) => ids.has(edge.sources[0]) && ids.has(edge.targets[0])),
+      layoutOptions: { ...graph.layoutOptions, ...child.layoutOptions, "elk.hierarchyHandling": "SEPARATE_CHILDREN" },
+    });
+    locals.set(child.id, local);
+    // Leave slack for grid snapping and the frame padding.
+    return { id: child.id, width: snapUp((local.width ?? 0) + 12), height: snapUp((local.height ?? 0) + 12) };
+  }));
+  const seen = new Set<string>();
+  const edges: ElkExtendedEdge[] = [];
+  for (const edge of graph.edges ?? []) {
+    const source = owner.get(edge.sources[0])!;
+    const target = owner.get(edge.targets[0])!;
+    const key = `${source}\0${target}`;
+    if (source === target || seen.has(key)) continue;
+    seen.add(key);
+    edges.push({ id: edge.id, sources: [source], targets: [target] });
+  }
+  const arranged = await layoutBalanced(elk, { ...graph, children, edges });
+  arranged.children = arranged.children?.map((child) => ({ ...child, children: locals.get(child.id)?.children }));
+  return arranged;
 }
 
 function flattenTables(
@@ -235,6 +306,15 @@ function isValidLayout(document: DbmlDocument, positions: AutoLayoutMap) {
       }
     }
   }
+  const groupedIds = new Set(document.groups.flatMap((group) => group.tableIds));
+  const envelopes = document.groups.map((group) => groupBounds(document, group, positions)).filter((bounds) => bounds !== null);
+  const outside = document.tables.filter((table) => !groupedIds.has(table.id)).map((table) => ({
+    ...positions[table.id], width: TABLE_NODE_WIDTH, height: tableNodeHeight(table),
+  }));
+  for (let index = 0; index < envelopes.length; index += 1) {
+    if (envelopes.slice(index + 1).some((other) => rectanglesOverlap(envelopes[index], other))) return false;
+    if (outside.some((other) => rectanglesOverlap(envelopes[index], other))) return false;
+  }
   return true;
 }
 
@@ -257,14 +337,33 @@ function fallbackLayout(document: DbmlDocument): AutoLayoutMap {
     if (!assigned.has(table.id)) clusters.push([table]);
   }
 
-  let clusterX = CANVAS_MARGIN;
-  for (const cluster of clusters) {
-    let y = CANVAS_MARGIN + GROUP_FRAME_PADDING.top;
-    for (const table of cluster) {
-      positionById[table.id] = { x: snap(clusterX + GROUP_FRAME_PADDING.left), y: snap(y) };
-      y += tableNodeHeight(table) + LAYOUT_GAPS.node;
+  const boxes = clusters.map((cluster) => {
+    const columns = Math.max(1, Math.ceil(Math.sqrt(cluster.length / 2)));
+    const heights = Array<number>(columns).fill(GROUP_FRAME_PADDING.top);
+    const members = cluster.map((table) => {
+      const column = heights.indexOf(Math.min(...heights));
+      const position = { x: GROUP_FRAME_PADDING.left + column * (TABLE_NODE_WIDTH + LAYOUT_GAPS.layer), y: heights[column] };
+      heights[column] += snapUp(tableNodeHeight(table)) + LAYOUT_GAPS.node;
+      return { table, position };
+    });
+    return { members,
+      width: snapUp(GROUP_FRAME_PADDING.left + columns * (TABLE_NODE_WIDTH + LAYOUT_GAPS.layer) - LAYOUT_GAPS.layer + GROUP_FRAME_PADDING.right),
+      height: snapUp(Math.max(...heights) - LAYOUT_GAPS.node + GROUP_FRAME_PADDING.bottom),
+    };
+  });
+  const shelfWidth = Math.max(...boxes.map((box) => box.width), Math.sqrt(boxes.reduce((area, box) => area + (box.width + LAYOUT_GAPS.component) * (box.height + LAYOUT_GAPS.component), 0) * 1.6));
+  let x = CANVAS_MARGIN, y = CANVAS_MARGIN, rowHeight = 0;
+  for (const box of boxes) {
+    if (x > CANVAS_MARGIN && x + box.width > CANVAS_MARGIN + shelfWidth) {
+      x = CANVAS_MARGIN;
+      y += rowHeight + LAYOUT_GAPS.component;
+      rowHeight = 0;
     }
-    clusterX += TABLE_NODE_WIDTH + GROUP_FRAME_PADDING.left + GROUP_FRAME_PADDING.right + LAYOUT_GAPS.component;
+    for (const { table, position } of box.members) {
+      positionById[table.id] = { x: snap(x + position.x), y: snap(y + position.y) };
+    }
+    rowHeight = Math.max(rowHeight, box.height);
+    x += box.width + LAYOUT_GAPS.component;
   }
   return positionById;
 }
@@ -303,9 +402,10 @@ export async function computeAutoLayout(document: DbmlDocument): Promise<AutoLay
     return { positions: {}, stats: { tables: 0, groups: 0, width: 0, height: 0, engine: "elk" } };
   }
 
+  document = { ...document, groups: getDiagramGroups(document) };
   try {
     const elk = new ELK();
-    const graph = await elk.layout(buildElkGraph(document));
+    const graph = await layoutClusters(elk, document);
     const tableById = new Map(document.tables.map((table) => [table.id, table]));
     const positions = normalizePositions(flattenTables(graph, tableById));
     if (!isValidLayout(document, positions)) throw new Error("ELK returned an invalid layout");

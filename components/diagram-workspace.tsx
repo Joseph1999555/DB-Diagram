@@ -3,6 +3,7 @@
 import {
   Background,
   BackgroundVariant,
+  BaseEdge,
   Handle,
   MarkerType,
   MiniMap,
@@ -17,6 +18,8 @@ import {
   type NodeChange,
   type NodeProps,
   type NodeTypes,
+  type EdgeProps,
+  type EdgeTypes,
 } from "@xyflow/react";
 import {
   ArrowDownToLine,
@@ -39,6 +42,7 @@ import {
   Focus,
   GitBranch,
   Grid2X2,
+  GripVertical,
   Hand,
   History,
   Import,
@@ -91,6 +95,9 @@ import type {
   SchemaMergeStrategy,
 } from "@/lib/schema-import";
 import type { SchemaExportFormat } from "@/lib/schema-export";
+import { getDiagramGroups } from "@/lib/diagram-groups";
+import { applyDiagramNodeChanges } from "@/lib/diagram-node-changes";
+import { chooseRelationPorts, routeRelation, roundedRoutePath, type TableRectangle } from "@/lib/relation-routing";
 import {
   GROUP_FRAME_PADDING,
   LAYOUT_GRID_SIZE,
@@ -213,6 +220,7 @@ const GENERATED_EXPORT_BLOCKED_MESSAGE = "Fix DBML errors before exporting gener
 const DEFAULT_VIEWPORT = { x: -42, y: 28, zoom: 0.7 };
 const SNAP_GRID: [number, number] = [LAYOUT_GRID_SIZE, LAYOUT_GRID_SIZE];
 const FLOW_PRO_OPTIONS = { hideAttribution: true } as const;
+const EMPTY_ROUTING_RECTANGLES: TableRectangle[] = [];
 const MINIMAP_STYLE: CSSProperties = { width: 124, height: 78 };
 const PRESENCE_POLL_MS = 500;
 const PRESENCE_RETRY_MAX_MS = 5000;
@@ -312,11 +320,12 @@ function resolveGroupColor(group: DbmlGroup, index: number) {
 }
 
 function buildNodes(document: DbmlDocument, layout: LayoutMap = {}): DiagramNode[] {
+  const groups = getDiagramGroups(document);
   const foreignFields = new Set(
     document.relations.flatMap((relation) => [relation.fromFieldId, relation.toFieldId]),
   );
   const groupByTableId = new Map<string, { group: DbmlGroup; index: number }>();
-  document.groups.forEach((group, index) => {
+  groups.forEach((group, index) => {
     group.tableIds.forEach((tableId) => {
       if (!groupByTableId.has(tableId)) groupByTableId.set(tableId, { group, index });
     });
@@ -345,7 +354,7 @@ function buildNodes(document: DbmlDocument, layout: LayoutMap = {}): DiagramNode
   });
   const tableNodeById = new Map(tableNodes.map((node) => [node.id, node]));
 
-  const groupNodes: DiagramNode[] = document.groups.flatMap((group, index) => {
+  const groupNodes: DiagramNode[] = groups.flatMap((group, index) => {
     const members = group.tableIds
       .filter((tableId) => groupByTableId.get(tableId)?.group.id === group.id)
       .map((tableId) => tableNodeById.get(tableId))
@@ -366,10 +375,13 @@ function buildNodes(document: DbmlDocument, layout: LayoutMap = {}): DiagramNode
         position: { x: minX, y: minY },
         data: { group, color: resolveGroupColor(group, index) },
         style: { width: maxX - minX, height: maxY - minY },
-        draggable: false,
-        selectable: false,
+        draggable: true,
+        dragHandle: ".group-label",
+        ariaLabel: `${group.name} group. Drag the header to move all ${members.length} tables.`,
+        selectable: true,
         connectable: false,
-        focusable: false,
+        deletable: false,
+        focusable: true,
         zIndex: -2,
       } as Node<GroupNodeData, "groupFrame">,
     ];
@@ -426,13 +438,12 @@ const TableNodeCard = memo(function TableNodeCard({ data, selected }: NodeProps)
       <div>
         {table.fields.map((field) => (
           <div className="field-row" key={field.id}>
-            <Handle
-              className="erd-handle"
-              id={`${field.id}:target`}
-              type="target"
-              position={Position.Left}
-              aria-label={`Connect to ${table.name}.${field.name}`}
-            />
+            {(["left", "right"] as const).map((side) => (
+              <Handle key={`target-${side}`} className="erd-handle erd-target-handle"
+                id={`${field.id}:target:${side}`} type="target"
+                position={side === "left" ? Position.Left : Position.Right}
+                aria-label={`Connect to ${table.name}.${field.name} on the ${side}`} />
+            ))}
             <div className="field-main">
               <span className="field-name">{field.name}</span>
               <span className="field-type">{field.type}</span>
@@ -444,13 +455,12 @@ const TableNodeCard = memo(function TableNodeCard({ data, selected }: NodeProps)
               )}
               {field.unique && !field.primaryKey && <span className="field-badge">UQ</span>}
             </div>
-            <Handle
-              className="erd-handle"
-              id={`${field.id}:source`}
-              type="source"
-              position={Position.Right}
-              aria-label={`Connect from ${table.name}.${field.name}`}
-            />
+            {(["left", "right"] as const).map((side) => (
+              <Handle key={`source-${side}`} className="erd-handle erd-source-handle"
+                id={`${field.id}:source:${side}`} type="source"
+                position={side === "left" ? Position.Left : Position.Right}
+                aria-label={`Connect from ${table.name}.${field.name} on the ${side}`} />
+            ))}
           </div>
         ))}
       </div>
@@ -464,15 +474,28 @@ const GroupFrameNode = memo(function GroupFrameNode({ data }: NodeProps) {
     <div
       className="group-frame"
       style={{ "--group-color": nodeData.color } as CSSProperties}
-      aria-hidden="true"
     >
-      <div className="group-label">
+      <div className="group-label" title={`Drag to move all tables in ${nodeData.group.name}`}>
+        <GripVertical size={12} aria-hidden="true" />
         <span />
         {nodeData.group.name}
       </div>
     </div>
   );
 });
+
+const SmartRelationEdge = memo(function SmartRelationEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, markerEnd, style, data, interactionWidth }: EdgeProps) {
+  const rectangles = (data?.rectangles ?? EMPTY_ROUTING_RECTANGLES) as TableRectangle[];
+  const lane = (data?.lane ?? 0) as number;
+  const path = useMemo(() => roundedRoutePath(routeRelation(
+    { x: sourceX, y: sourceY }, { x: targetX, y: targetY },
+    sourcePosition === Position.Left ? "left" : "right",
+    targetPosition === Position.Left ? "left" : "right", rectangles, lane,
+  )), [sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, rectangles, lane]);
+  return <BaseEdge id={id} path={path} markerEnd={markerEnd} style={style} interactionWidth={interactionWidth ?? 20} />;
+});
+
+const EDGE_TYPES: EdgeTypes = { smartRelation: SmartRelationEdge };
 
 function ZoomLevel() {
   const zoom = useStore((state) => Math.round(state.transform[2] * 100));
@@ -1015,7 +1038,7 @@ function Workspace() {
 
   const [dbml, setDbml] = useState(DEFAULT_DBML);
   const [documentModel, setDocumentModel] = useState(DEFAULT_DOCUMENT);
-  const [nodes, setNodes, onNodesChange] = useNodesState<DiagramNode>(buildNodes(DEFAULT_DOCUMENT));
+  const [nodes, setNodes] = useNodesState<DiagramNode>(buildNodes(DEFAULT_DOCUMENT));
   const [projectName, setProjectName] = useState("Northstar Commerce");
   const [selectedTableId, setSelectedTableId] = useState<string | null>(
     DEFAULT_DOCUMENT.tables.find((table) => table.name === "orders")?.id ?? null,
@@ -1377,7 +1400,12 @@ function Workspace() {
   }, [removePresence]);
 
   const handleNodesChange = useCallback((changes: NodeChange<DiagramNode>[]) => {
-    onNodesChange(changes);
+    if (changes.some((change) => change.type === "position" && change.position)) {
+      // A user's drag supersedes any asynchronous auto-layout already running.
+      layoutRequestRef.current += 1;
+      setIsSmartLayouting(false);
+    }
+    setNodes((previous) => applyDiagramNodeChanges(documentModelRef.current, changes, previous));
     if (
       changes.some(
         (change) =>
@@ -1388,7 +1416,7 @@ function Workspace() {
     ) {
       setLayoutRevision((revision) => revision + 1);
     }
-  }, [onNodesChange]);
+  }, [setNodes]);
 
   useEffect(() => {
     nodesRef.current = nodes;
@@ -1734,19 +1762,21 @@ function Workspace() {
     return connected;
   }, [documentModel.relations, selectedRelation, selectedTableId]);
 
+  const diagramGroups = useMemo(() => getDiagramGroups(documentModel), [documentModel]);
   const activeGroupModel = useMemo(
-    () => documentModel.groups.find((group) => group.id === activeGroup),
-    [activeGroup, documentModel.groups],
+    () => diagramGroups.find((group) => group.id === activeGroup),
+    [activeGroup, diagramGroups],
   );
 
   const displayNodes = useMemo(() => {
-    const hasFocus = Boolean(selectedTableId || selectedRelationId);
+    const hasFocus = Boolean(selectedTable || selectedRelation);
     const activeTableIds = activeGroupModel ? new Set(activeGroupModel.tableIds) : null;
     return nodes.map((node) => {
       if (node.type === "groupFrame") {
         const groupData = node.data as GroupNodeData;
         const hidden = activeGroup !== "all" && groupData.group.id !== activeGroup;
-        return Boolean(node.hidden) === hidden ? node : { ...node, hidden };
+        const draggable = canvasMode === "select";
+        return Boolean(node.hidden) === hidden && node.draggable === draggable ? node : { ...node, hidden, draggable };
       }
       const tableData = node.data as TableNodeData;
       const hidden = Boolean(activeTableIds && !activeTableIds.has(node.id));
@@ -1763,23 +1793,35 @@ function Workspace() {
             data: { ...tableData, dimmed, openCommentCount, onOpenComments: openTableComments },
           };
     });
-  }, [activeGroup, activeGroupModel, connectedTableIds, nodes, openTableComments, selectedRelationId, selectedTableId, tableOpenCommentCounts]);
+  }, [activeGroup, activeGroupModel, canvasMode, connectedTableIds, nodes, openTableComments, selectedRelation, selectedTable, tableOpenCommentCounts]);
+
+  const routingRectangles = useMemo(() => {
+    const visible = activeGroupModel ? new Set(activeGroupModel.tableIds) : null;
+    return nodes.filter((node) => node.type === "tableCard" && (!visible || visible.has(node.id))).map((node) => ({
+      id: node.id, ...node.position, width: TABLE_NODE_WIDTH, height: tableNodeHeight((node.data as TableNodeData).table),
+    }));
+  }, [nodes, activeGroupModel]);
 
   const displayEdges = useMemo(() => {
-    const hasFocus = Boolean(selectedTableId || selectedRelationId);
+    const hasFocus = Boolean(selectedTable || selectedRelation);
     const visibleIds = activeGroupModel ? new Set(activeGroupModel.tableIds) : null;
-    return documentModel.relations.map((relation) => {
+    const rectangleById = new Map(routingRectangles.map((rectangle) => [rectangle.id, rectangle]));
+    return documentModel.relations.flatMap((relation, index) => {
+      const source = rectangleById.get(relation.fromTableId);
+      const target = rectangleById.get(relation.toTableId);
+      if (!source || !target) return [];
+      const ports = chooseRelationPorts(source, target);
       const related = connectedTableIds.has(relation.fromTableId) && connectedTableIds.has(relation.toTableId);
       const highlighted = relation.id === selectedRelationId || (selectedTableId !== null && related);
       const color = relationColors[relation.id] ?? "#51d6f5";
-      return {
+      return [{
         id: relation.id,
         source: relation.fromTableId,
         target: relation.toTableId,
-        sourceHandle: `${relation.fromFieldId}:source`,
-        targetHandle: `${relation.toFieldId}:target`,
-        type: "smoothstep",
-        pathOptions: { borderRadius: 8, offset: 20 },
+        sourceHandle: `${relation.fromFieldId}:source:${ports.source}`,
+        targetHandle: `${relation.toFieldId}:target:${ports.target}`,
+        type: "smartRelation",
+        data: { rectangles: routingRectangles, lane: (index % 4) * 4 },
         markerEnd: {
           type: MarkerType.ArrowClosed,
           color: highlighted ? color : "var(--edge-muted)",
@@ -1791,9 +1833,9 @@ function Workspace() {
         hidden: visibleIds ? !visibleIds.has(relation.fromTableId) || !visibleIds.has(relation.toTableId) : false,
         style: { "--edge-color": color } as CSSProperties,
         zIndex: highlighted ? 8 : 1,
-      };
+      }];
     });
-  }, [activeGroupModel, connectedTableIds, documentModel.relations, relationColors, selectedRelationId, selectedTableId]);
+  }, [activeGroupModel, connectedTableIds, documentModel.relations, relationColors, routingRectangles, selectedRelation, selectedRelationId, selectedTable, selectedTableId]);
 
   const tableRelations = useMemo(() => {
     if (!selectedTable) return [];
@@ -1891,12 +1933,12 @@ function Workspace() {
       if (!connection.source || !connection.target || !connection.sourceHandle || !connection.targetHandle) return;
       const sourceTable = documentModel.tables.find((table) => table.id === connection.source);
       const targetTable = documentModel.tables.find((table) => table.id === connection.target);
-      const sourceFieldId = connection.sourceHandle.replace(/:source$/, "").replace(/:target$/, "");
-      const targetFieldId = connection.targetHandle.replace(/:source$/, "").replace(/:target$/, "");
+      const sourceFieldId = connection.sourceHandle.replace(/:(?:source|target)(?::(?:left|right))?$/, "");
+      const targetFieldId = connection.targetHandle.replace(/:(?:source|target)(?::(?:left|right))?$/, "");
       const sourceField = sourceTable?.fields.find((field) => field.id === sourceFieldId);
       const targetField = targetTable?.fields.find((field) => field.id === targetFieldId);
       if (!sourceTable || !targetTable || !sourceField || !targetField) return;
-      appendDbml(`Ref: ${sourceTable.name}.${sourceField.name} > ${targetTable.name}.${targetField.name}`);
+      appendDbml(`Ref: ${qualifiedTableName(sourceTable)}.${sourceField.name} > ${qualifiedTableName(targetTable)}.${targetField.name}`);
       showToast("Relationship added");
     },
     [appendDbml, documentModel.tables, showToast],
@@ -2589,7 +2631,7 @@ function Workspace() {
                   aria-label="Filter schema outline"
                 />
               </label>
-              {[{ id: "ungrouped", name: "All tables", tableIds: documentModel.tables.map((table) => table.id) } as DbmlGroup, ...documentModel.groups].map(
+              {[{ id: "ungrouped", name: "All tables", tableIds: documentModel.tables.map((table) => table.id) } as DbmlGroup, ...diagramGroups].map(
                 (group, groupIndex) => {
                   const tables = outlineTables.filter((table) => group.tableIds.includes(table.id));
                   if (tables.length === 0) return null;
@@ -2656,7 +2698,7 @@ function Workspace() {
               <Grid2X2 size={11} />
               All schema
             </button>
-            {documentModel.groups.map((group, index) => (
+            {diagramGroups.map((group, index) => (
               <button
                 className={`view-chip ${activeGroup === group.id ? "active" : ""}`}
                 key={group.id}
@@ -2716,6 +2758,7 @@ function Workspace() {
               }
             }}
             onConnect={onConnect}
+            edgeTypes={EDGE_TYPES}
             defaultViewport={DEFAULT_VIEWPORT}
             minZoom={0.18}
             maxZoom={2.4}
@@ -2923,7 +2966,7 @@ function Workspace() {
               <section className="inspector-section">
                 <div className="section-label">Group</div>
                 <p className="inspector-copy">
-                  {documentModel.groups.find((group) => group.tableIds.includes(selectedTable.id))?.name ?? "Ungrouped"}
+                  {diagramGroups.find((group) => group.tableIds.includes(selectedTable.id))?.name ?? "Ungrouped"}
                 </p>
               </section>
               <section className="inspector-section">

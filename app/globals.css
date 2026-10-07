@@ -1001,7 +1001,7 @@ select:focus-visible,
 
 .erd-node {
   width: 248px;
-  overflow: hidden;
+  overflow: visible;
   border: 1px solid var(--line-strong);
   border-radius: 10px;
   background: var(--node);
@@ -1026,6 +1026,7 @@ select:focus-visible,
 }
 
 .table-header {
+  border-radius: 9px 9px 0 0;
   min-height: 39px;
   display: flex;
   align-items: center;
@@ -1187,7 +1188,15 @@ select:focus-visible,
 
 .react-flow__handle.erd-handle:hover {
   background: var(--accent);
-  transform: scale(1.45);
+}
+
+.react-flow__handle.erd-source-handle { top: calc(50% - 4px); }
+.react-flow__handle.erd-target-handle { top: calc(50% + 4px); }
+
+.react-flow__node-groupFrame { pointer-events: none !important; }
+.react-flow__node-groupFrame.selected .group-frame {
+  border-color: var(--group-color);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--group-color) 30%, transparent);
 }
 
 .group-frame {
@@ -1201,6 +1210,10 @@ select:focus-visible,
 }
 
 .group-label {
+  pointer-events: auto;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
   display: flex;
   align-items: center;
   gap: 7px;
@@ -1217,6 +1230,8 @@ select:focus-visible,
   letter-spacing: 0.07em;
   text-transform: uppercase;
 }
+
+.react-flow__node-groupFrame.dragging .group-label { cursor: grabbing; }
 
 .group-label span {
   width: 6px;
